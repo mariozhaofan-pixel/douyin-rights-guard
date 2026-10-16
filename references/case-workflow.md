@@ -1,6 +1,6 @@
 # 本地案件档案与命令
 
-`scripts/case_manager.py` 使用 Python 标准库管理本地案件、文件指纹和提交前检查。它不会登录账号、判断身份证真伪、作出侵权裁决或联网提交投诉。作者侧证明全部由用户提供截图，无需作者账号登录。仅检索举报账号需要授权登录，作品复核及官方表单操作由主工作流完成；批量操作见[脚本优先](script-first.md)。
+`scripts/case_manager.py` 使用 Python 标准库管理本地案件、文件指纹和提交前检查。它不会登录账号、判断身份证真伪、作出侵权裁决或联网提交投诉。作者后台/私密页和本人视角证明由用户提供截图，无需作者账号登录；经授权可用非作者检索账号查看作者公开主页/原作页补证，按真实来源登记。作品复核及官方表单操作由主工作流完成；批量操作见[脚本优先](script-first.md)。
 
 默认活动范围为**抖音、快手、哔哩哔哩**。小红书字段和旧记录仅保留历史兼容；当前不安排小红书检索、补件或提交。旧授权、待提交包或本地gate曾通过，都不能覆盖用户后来取消平台的指令。
 
@@ -168,7 +168,7 @@ python "$SkillDir\scripts\case_manager.py" evidence-add --root "$CaseRoot" --fil
 
 | 类型 | 应登记的内容 |
 | --- | --- |
-| `douyin_profile` | 已登录账号的抖音主页截图 |
+| `douyin_profile` | 作者抖音主页截图，注明用户本人视角或经授权采集的公开访客视角；后者不代替平台要求的本人证明 |
 | `douyin_work` | 本次原作页面截图；必须用 `--work-id` 关联具体原作 |
 | `douyin_creator_center` | 创作者中心内容管理中对应作品的截图；必须用 `--work-id` 关联具体原作 |
 | `original_video` | 原作视频；必须用 `--work-id` 关联原作 |
@@ -378,7 +378,7 @@ python "$SkillDir\scripts\case_manager.py" summary --root "$CaseRoot"
 
 ## 账号标识与举报登录（2026-10-16）
 
-作者材料由用户截图提供；`author`仅保存稳定账号ID，供关联作品和排除自有账号，不需要授权登录。仅`reporter`登录，记录search/report用途。已知自有账号、历史作者和旧自有记录均参与排除；切换reporter不会覆盖作者证据、真实权利人或历史回执。
+作者后台/私密页材料由用户截图提供，已授权公开原作可用reporter补证；`author`仅保存稳定账号ID，供关联作品和排除自有账号，不需要授权登录。仅`reporter`登录，记录search/report用途。已知自有账号、历史作者和旧自有记录均参与排除；切换reporter不会覆盖作者证据、真实权利人或历史回执。
 
 ```powershell
 python "$SkillDir\scripts\case_manager.py" account-set --root "$CaseRoot" --platform douyin --role author --account-id "$AuthorId"

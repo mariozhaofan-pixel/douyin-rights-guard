@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -498,5 +499,147 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["denominator"], 0)
         self.assertEqual(wf.execution_priority(self.root, self.case)["douyin_stage"], "no_recorded_pending_work")
         self.assertFalse(wf.execution_priority(self.root, self.case)["off_platform_submission_deferred"])
+
+    def followup_snapshot(self, result):
+        return cm.read_json(self.root / result["snapshot"])
+
+    def register_synthetic_material(self, name="original.mp4", work_id="work_1", data=b"synthetic video"):
+        path = self.root / "02_originals" / name
+        path.write_bytes(data)
+        manifest = cm.manifest(self.root)
+        manifest["evidence"].append({"evidence_id": "ev_" + name, "kind": "original_video", "work_id": work_id,
+                                     "path": path.relative_to(self.root).as_posix(), "sha256": cm.sha256(path)})
+        cm.atomic_json(self.root / cm.MANIFEST, manifest)
+        return path
+
+    def test_followup_preserves_immutable_history_and_pending_without_mutating_case(self):
+        self.add_candidate()
+        before = (self.root / "case.json").read_bytes()
+        first = wf.followup(self.root, self.case)
+        first_bytes = (self.root / first["snapshot"]).read_bytes()
+        second = wf.followup(self.root, self.case)
+        self.assertNotEqual(first["snapshot"], second["snapshot"])
+        self.assertEqual(first_bytes, (self.root / first["snapshot"]).read_bytes())
+        baseline = self.followup_snapshot(first)["candidates"][0]
+        repeat = self.followup_snapshot(second)["candidates"][0]
+        self.assertEqual(baseline["observation"], "baseline_not_independently_reviewed")
+        self.assertFalse(baseline["evidence_changed"])
+        self.assertEqual(repeat["observation"], "unchanged")
+        self.assertIn("original_video_evidence_missing", repeat["missing_requirements"])
+        self.assertIn("inventory_explicitly_authorized_original_directories", repeat["next_actions"])
+        self.assertEqual(before, (self.root / "case.json").read_bytes())
+
+    def test_followup_inventories_only_explicit_trees_without_binding_or_redirects(self):
+        self.add_candidate()
+        originals = self.base / "authorized_originals"
+        originals.mkdir()
+        (originals / "episode_2.mp4").write_bytes(b"actual clip")
+        (originals / "notes.txt").write_text("not a video", encoding="utf-8")
+        skipped = originals / "redirected"
+        skipped.mkdir()
+        (skipped / "outside.mp4").write_bytes(b"must not read")
+        (self.base / "elsewhere.mp4").write_bytes(b"not authorized")
+        real_is_redirect = wf.is_redirect
+        with mock.patch.object(wf, "is_redirect", side_effect=lambda path: path == skipped or real_is_redirect(path)):
+            result = wf.followup(self.root, self.case, [str(originals), str(originals)])
+        inventory = self.followup_snapshot(result)["original_inventories"]
+        self.assertEqual((result["inventoried_directory_count"], result["inventoried_video_count"]), (1, 1))
+        self.assertEqual(inventory[0]["skipped_redirects"], 1)
+        self.assertEqual(Path(inventory[0]["files"][0]["path"]).name, "episode_2.mp4")
+        self.assertEqual(cm.manifest(self.root)["evidence"], [])
+        self.assertEqual(len(self.case["works"]), 1)
+        self.assertNotIn("actual clip", json.dumps(inventory))
+        self.assertEqual(wf.followup(self.root, self.case)["inventoried_video_count"], 0)
+
+    def test_followup_refuses_redirected_root_and_skips_real_symlink_when_supported(self):
+        originals = self.base / "originals"
+        originals.mkdir()
+        with mock.patch.object(wf, "is_redirect", side_effect=lambda path: path == originals):
+            with self.assertRaisesRegex(cm.CaseError, "non_redirected"):
+                wf.followup(self.root, self.case, [str(originals)])
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "private.mp4").write_bytes(b"must not read")
+        try:
+            (originals / "link").symlink_to(outside, target_is_directory=True)
+        except OSError:
+            return  # Windows without symlink permission is covered by the reparse simulation above.
+        result = wf.followup(self.root, self.case, [str(originals)])
+        self.assertEqual(result["inventoried_video_count"], 0)
+        self.assertEqual(self.followup_snapshot(result)["original_inventories"][0]["skipped_redirects"], 1)
+
+    def test_followup_ignores_mtime_logs_and_unrelated_material_but_detects_content(self):
+        self.add_candidate()
+        path = self.register_synthetic_material()
+        wf.followup(self.root, self.case)
+        os.utime(path, (1, 1))
+        self.register_synthetic_material("other.mp4", "unrelated_work", b"different work")
+        (self.root / "08_logs" / "unrelated.json").write_text('{"new":true}', encoding="utf-8")
+        self.assertEqual(wf.followup(self.root, self.case)["evidence_changed_count"], 0)
+        path.write_bytes(b"changed actual content")
+        changed = wf.followup(self.root, self.case)
+        self.assertEqual(changed["evidence_changed_count"], 1)
+        task = self.followup_snapshot(changed)["candidates"][0]
+        self.assertTrue(task["original_binding_or_material_changed"])
+        self.assertIn("evidence_integrity_failed", task["missing_requirements"])
+        again = wf.followup(self.root, self.case)
+        self.assertEqual((again["evidence_changed_count"], again["pending_recheck_count"]), (0, 1))
+
+    def test_followup_new_episode_requires_recheck_until_new_human_record(self):
+        self.add_candidate()
+        candidate = self.case["candidates"][0]
+        candidate["manual_review"].update(status="confirmed_copy", reviewer="agent", reviewed_at="2026-01-01T00:00:00+00:00")
+        self.register_synthetic_material()
+        wf.followup(self.root, self.case)
+        self.case["works"].append({"work_id": "work_2", "title": "Synthetic episode 2", "url": "https://www.douyin.com/video/987"})
+        candidate["original_work_id"] = "work_2"
+        self.register_synthetic_material("episode_2.mp4", "work_2", b"episode 2")
+        changed = wf.followup(self.root, self.case)
+        self.assertEqual(changed["pending_recheck_count"], 1)
+        task = self.followup_snapshot(changed)["candidates"][0]
+        self.assertIn("archive_previous_review_before_reviewing_changed_original_or_material", task["next_actions"])
+        candidate["overlap_segments"] = [{"new": "segment edit alone is not a re-review"}]
+        self.assertEqual(wf.followup(self.root, self.case)["pending_recheck_count"], 1)
+        candidate["manual_review"]["reviewed_at"] = "2026-01-02T00:00:00+00:00"
+        self.assertEqual(wf.followup(self.root, self.case)["pending_recheck_count"], 0)
+        self.assertEqual(candidate["submission_status"], "not_submitted")
+
+    def test_followup_preserves_douyin_priority_but_allows_local_kuaishou_testing(self):
+        self.add_candidate()
+        self.case["candidates"][0]["manual_review"].update(status="insufficient_evidence", reviewer="agent", reviewed_at=cm.now())
+        ks_id = self.add_candidate("ks123", "kuaishou")
+        result = wf.followup(self.root, self.case)
+        snapshot = self.followup_snapshot(result)
+        task = next(row for row in snapshot["candidates"] if row["candidate_id"] == ks_id)
+        self.assertTrue(snapshot["execution_priority"]["off_platform_submission_deferred"])
+        self.assertTrue(task["submission_deferred_by_platform_order"])
+        self.assertTrue(task["local_testing_and_preparation_allowed"])
+
+    def test_followup_submitted_unknown_and_excluded_are_not_requeued(self):
+        for index in range(3):
+            self.add_candidate(str(456 + index))
+        self.case["candidates"][0]["submission_status"] = "submitted"
+        self.case["candidates"][1]["submission_status"] = "unknown"
+        self.case["candidates"][2]["manual_review"].update(status="not_copy", reviewer="agent", reviewed_at=cm.now())
+        with mock.patch.object(cm, "gate", side_effect=AssertionError("should not prepare an existing disposition")):
+            snapshot = self.followup_snapshot(wf.followup(self.root, self.case))
+        self.assertEqual({row["action"] for row in snapshot["candidates"]}, {
+            "check_official_review_and_removal_result_do_not_resubmit", "verify_official_receipt_before_any_retry",
+            "preserve_recorded_exclusion_no_automatic_reopening"})
+        self.assertTrue(all(not row["next_actions"] for row in snapshot["candidates"]))
+
+    def test_followup_cli_prints_counts_and_local_log_paths_only(self):
+        self.add_candidate()
+        originals = self.base / "do_not_print_this_original_directory"
+        originals.mkdir()
+        (originals / "sensitive_filename.mp4").write_bytes(b"content must stay local")
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            code = wf.main(["followup", "--root", str(self.root), "--original-dir", str(originals)])
+        self.assertEqual(code, 0)
+        data = json.loads(stdout.getvalue())
+        self.assertEqual(data["inventoried_video_count"], 1)
+        self.assertNotIn("sensitive_filename", stdout.getvalue())
+        self.assertNotIn(str(originals), stdout.getvalue())
+        self.assertFalse(data["network_submission_performed"])
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,9 @@ import io
 import json
 from pathlib import Path
 import re
+import stat
 import sys
+from uuid import uuid4
 from urllib.parse import parse_qs, urlsplit
 
 try:
@@ -23,6 +25,8 @@ except ModuleNotFoundError:  # Support loading this file with importlib in tests
 PLATFORMS = ("douyin", "bilibili", "kuaishou")
 BATCH_FOLDER = "03_search/workflow"
 RESOLUTIONS = "03_search/workflow-resolutions.json"
+FOLLOWUP_LATEST = "08_logs/followup/latest.json"
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ts", ".mts"}
 MAX_INPUT_BYTES = 10 * 1024 * 1024
 MAX_ROWS = 5000
 URL_RE = re.compile(r"https?://[^\s<>\"'，。；、）】]+")
@@ -440,7 +444,7 @@ def plan(root, case):
     tasks.sort(key=lambda task: (task["action"] in ("check_official_review_and_removal_result",
                 "inactive_platform_preserve_history", "excluded_after_recorded_human_review"), platform_priority(task)))
     return {**data, "execution_priority": priority, "next_steps": tasks,
-            "account_reminder": "只登录用户授权的非作者检索/举报操作账号；作者主页、作品与创作者中心证明全部复用用户提供截图，不要求作者账号登录。操作账号不同不改变权利人身份，也不代替平台要求的代理授权。"}
+            "account_reminder": "只登录用户授权的非作者检索/举报操作账号；后台、私密和本人视角证明由用户提供；经授权可用举报账号访问作者公开主页和原作补证，不要求作者账号登录。操作账号不同不改变权利人身份，也不代替平台要求的代理授权。"}
 
 
 def attachment_refs(root, candidate):
@@ -645,10 +649,160 @@ def prepare(root, case, candidate_id=None):
     return {"status": "prepared", "folder": relative, "prepared": len(prepared), "skipped": len(skipped), "execution_priority": priority, "network_submission_performed": False}
 
 
+def is_redirect(path):
+    info = path.lstat()
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+
+
+def inventory_original_dirs(values):
+    """Read only explicitly supplied trees, never follow junctions or symlinks."""
+    inventories, seen = [], set()
+    for value in values:
+        path = Path(value).expanduser().absolute()
+        if any(is_redirect(part) for part in (path, *path.parents)) or not path.is_dir():
+            raise cm.CaseError("original_directory_must_be_existing_non_redirected_directory")
+        path = path.resolve()
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        entry = {"directory": str(path), "files": [], "skipped_redirects": 0, "unreadable_entries": 0}
+        pending = [path]
+        while pending:
+            folder = pending.pop()
+            try:
+                # Recheck before enumeration, including directories queued earlier.
+                if is_redirect(folder) or not cm.contained(folder.resolve(), path):
+                    entry["skipped_redirects"] += 1
+                    continue
+                children = list(folder.iterdir())
+            except OSError:
+                entry["unreadable_entries"] += 1
+                continue
+            for child in children:
+                try:
+                    if is_redirect(child) or not cm.contained(child.resolve(), path):
+                        entry["skipped_redirects"] += 1
+                    elif child.is_dir():
+                        pending.append(child)
+                    elif child.is_file() and child.suffix.lower() in VIDEO_SUFFIXES:
+                        info = child.stat()
+                        entry["files"].append({"path": str(child), "sha256": cm.sha256(child),
+                            "size_bytes": info.st_size, "modified_at_ns_hint": info.st_mtime_ns})
+                except OSError:
+                    entry["unreadable_entries"] += 1
+        entry["files"].sort(key=lambda row: row["path"])
+        inventories.append(entry)
+    return inventories
+
+
+def followup_material(root, candidate, evidence):
+    """Fingerprint only claim-bound material bytes, not logs, paths or mtimes."""
+    work_id, cid = candidate.get("original_work_id"), candidate["candidate_id"]
+    material = set()
+    for row in evidence:
+        if not isinstance(row, dict) or row.get("kind") not in {
+                "douyin_profile", "douyin_work", "douyin_creator_center", "original_video",
+                "candidate_video", "candidate_page", "candidate_frame", "comparison"}:
+            continue
+        if not (row.get("kind") == "douyin_profile" or row.get("candidate_id") == cid
+                or work_id and row.get("work_id") == work_id and not row.get("candidate_id")):
+            continue
+        try:
+            path = cm.member(root, row.get("path", ""))
+            if path.relative_to(root).parts[0] not in ("02_originals", "04_candidates", "05_comparisons"):
+                continue
+            content = cm.sha256(path) if path.is_file() else "missing"
+        except (cm.CaseError, OSError, ValueError):
+            content = "unreadable"
+        material.add((row.get("kind", ""), str(row.get("work_id") or ""), str(row.get("candidate_id") or ""), content))
+    original_material = sorted(row for row in material if row[0] in ("original_video", "douyin_work", "douyin_creator_center"))
+    return {"fingerprint": digest({"work_id": work_id, "material": sorted(material)}),
+            "original_fingerprint": digest({"work_id": work_id, "material": original_material})}
+
+
+def followup(root, case, original_dirs=()):
+    """Save an immutable local checkpoint; no case fields or platform actions change."""
+    latest_path = cm.member(root, FOLLOWUP_LATEST)
+    previous = cm.read_json(latest_path) if latest_path.exists() else {"schema_version": 1, "candidates": {}}
+    if previous.get("schema_version") != 1 or not isinstance(previous.get("candidates"), dict):
+        raise cm.CaseError("invalid_followup_state")
+    inventories = inventory_original_dirs(original_dirs)
+    evidence = cm.manifest(root)["evidence"]
+    active = cm.platform_scope(case)["active_platforms"]
+    priority = execution_priority(root, case)
+    tasks, records = [], {}
+    for candidate in sorted(case.get("candidates", []), key=platform_priority):
+        cid = identifier(candidate.get("candidate_id"), "candidate_id")
+        old = previous["candidates"].get(cid, {})
+        material = followup_material(root, candidate, evidence)
+        changed = bool(old) and old.get("fingerprint") != material["fingerprint"]
+        original_changed = bool(old) and old.get("original_fingerprint") != material["original_fingerprint"]
+        review = candidate.get("manual_review", {})
+        review_signature = digest({"review": review, "segments": candidate.get("overlap_segments"),
+                                   "browser_review": candidate.get("browser_visual_review")})
+        # A repeated poll never clears a pending recheck. A newly recorded human
+        # review can do so; this still does not certify that review or permit submission.
+        newly_reviewed = (review_signature != old.get("review_signature") and review.get("reviewer") in ("agent", "user")
+                          and bool(review.get("reviewed_at")) and review.get("reviewed_at") != old.get("reviewed_at"))
+        recheck = changed or bool(old.get("recheck_required") and not newly_reviewed)
+        state = candidate.get("submission_status")
+        excluded = reviewed_exclusion(candidate)
+        missing, actions = [], []
+        if candidate.get("platform") not in active:
+            action = "inactive_platform_preserve_history"
+        elif state == "submitted":
+            action = "check_official_review_and_removal_result_do_not_resubmit"
+        elif state in ("unknown", "submitting"):
+            action = "verify_official_receipt_before_any_retry"
+        elif state != "not_submitted":
+            action = "review_existing_submission_or_supplement_record"
+        elif excluded:
+            action = "preserve_recorded_exclusion_no_automatic_reopening"
+        else:
+            gate = cm.gate(root, case, cid)
+            missing = list(gate["reasons"])
+            original = next((w for w in case.get("works", []) if w.get("work_id") == candidate.get("original_work_id")), {})
+            if normalize_url(original.get("url", "")).get("resolution_status") != "resolved":
+                missing.append("canonical_original_url_not_resolved")
+            needs_original = (review.get("status") in ("insufficient", "insufficient_evidence") or any(
+                reason.startswith("original_") or reason.startswith("missing_douyin_") or reason in ("evidence_integrity_failed", "ownership_pending_or_blocked")
+                for reason in missing))
+            if needs_original:
+                actions += ["inventory_explicitly_authorized_original_directories",
+                    "inspect_author_public_works_only_with_authorized_non_author_reporter",
+                    "verify_corresponding_episode_version_public_link_and_ownership",
+                    "register_correct_work_and_evidence_without_reusing_episode_1_for_other_episodes"]
+            if recheck:
+                missing.append("changed_material_requires_new_comparison_and_human_review")
+                actions.append("archive_previous_review_before_reviewing_changed_original_or_material")
+            actions += ["rerun_media_batch_for_candidate_then_human_review", "rerun_workflow_plan_and_prepare"]
+            action = "continue_evidence_followup" if missing or recheck else "official_form_review_subject_to_douyin_priority"
+        records[cid] = {**material, "review_signature": review_signature, "reviewed_at": review.get("reviewed_at"), "recheck_required": recheck}
+        tasks.append({"candidate_id": cid, "platform": candidate.get("platform"), "original_work_id": candidate.get("original_work_id"),
+            "submission_status": state, "action": action, "missing_requirements": list(dict.fromkeys(missing)),
+            "next_actions": actions, "observation": "evidence_changed" if changed else "unchanged" if old else "baseline_not_independently_reviewed",
+            "evidence_changed": changed, "original_binding_or_material_changed": original_changed,
+            "human_recheck_required": recheck, "local_testing_and_preparation_allowed": candidate.get("platform") in active,
+            "submission_deferred_by_platform_order": bool(priority["off_platform_submission_deferred"] and candidate.get("platform") != "douyin")})
+    snapshot_relative = "08_logs/followup/run-" + uuid4().hex + ".json"
+    snapshot = {"schema_version": 1, "created_at": cm.now(), "network_submission_performed": False,
+        "case_review_authorization_and_receipts_changed": False, "execution_priority": priority,
+        "inventory_note": "Only explicitly supplied directories were read. Names and mtimes are discovery hints, never publication or ownership proof. Files are not bound to works automatically.",
+        "original_inventories": inventories, "candidates": tasks,
+        "unregistered_search_followup": [task for task in plan(root, case)["next_steps"] if "candidate_id" not in task]}
+    cm.atomic_json(cm.member(root, snapshot_relative), snapshot)
+    cm.atomic_json(latest_path, {"schema_version": 1, "latest_snapshot": snapshot_relative, "candidates": records})
+    return {"status": "followup_recorded", "snapshot": snapshot_relative, "latest": FOLLOWUP_LATEST,
+        "candidate_count": len(tasks), "evidence_changed_count": sum(task["evidence_changed"] for task in tasks),
+        "pending_recheck_count": sum(task["human_recheck_required"] for task in tasks),
+        "inventoried_directory_count": len(inventories), "inventoried_video_count": sum(len(item["files"]) for item in inventories),
+        "network_submission_performed": False, "case_review_authorization_and_receipts_changed": False}
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("import-search", "resolve-entry", "plan", "prepare", "report"):
+    for name in ("import-search", "resolve-entry", "plan", "prepare", "report", "followup"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--root", required=True)
         if name == "import-search":
@@ -672,6 +826,9 @@ def parser():
             cmd.add_argument("--source-note", required=True, help="Actual official resolution evidence; never a guessed content ID")
         elif name == "prepare":
             cmd.add_argument("--candidate")
+        elif name == "followup":
+            cmd.add_argument("--original-dir", action="append", default=[],
+                             help="Explicitly authorized local video directory; repeat to inventory multiple trees without following links")
     return p
 
 
@@ -684,6 +841,7 @@ def main(argv=None):
         root, case = cm.load_case(args.root)
         result = import_search(root, case, args) if args.command == "import-search" else (
             resolve_entry(root, case, args) if args.command == "resolve-entry" else
+            followup(root, case, args.original_dir) if args.command == "followup" else
             prepare(root, case, args.candidate) if args.command == "prepare" else
             plan(root, case) if args.command == "plan" else report(root, case))
         print(json.dumps(result, ensure_ascii=False, indent=2))

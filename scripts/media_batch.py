@@ -130,7 +130,9 @@ def run_batch(args):
                 media = verified_media(root, evidence, checks, "candidate_video", "candidate_id", cid)
                 media = media or saved_download(root, item, url)
                 if not original:
-                    result["status"] = "original_media_missing_or_ambiguous"
+                    result.update(status="original_media_missing_or_ambiguous", original_work_id=candidate.get("original_work_id"),
+                                  next_action="inventory_authorized_local_originals_then_review_author_public_works_and_map_episode_version",
+                                  resume_after="matching_original_video_registered_or_conflicting_versions_resolved")
                 elif media and comparison_valid(root, item.get("comparison", {}), fingerprint_for(original, media, args)):
                     result.update(status="reused_comparison", report=item["comparison"]["report"])
                 elif not media and not args.download:

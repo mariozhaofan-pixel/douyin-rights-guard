@@ -182,6 +182,25 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(compare.call_count, 2)
         self.assertEqual(before, (self.root / "case.json").read_bytes())
 
+    def test_missing_episode_does_not_block_kuaishou_preparation_and_new_original_resumes_douyin(self):
+        self.candidates(2, local=True)
+        self.case["works"].append({"work_id": "w2", "url": "https://www.douyin.com/video/124", "title": "Synthetic episode 2"})
+        self.case["candidates"][0]["original_work_id"] = "w2"
+        self.case["candidates"][1].update(platform="kuaishou", video_id="ks1001",
+                                        canonical_url=cm.canonical_url("kuaishou", "ks1001"))
+        cm.atomic_json(self.root / "case.json", self.case)
+        before = (self.root / "case.json").read_bytes()
+        with patch.object(mp, "compare", side_effect=self.compare) as compare:
+            first = mb.run_batch(self.args(limit=1))
+            self.assertEqual(first["results"][0]["status"], "original_media_missing_or_ambiguous")
+            self.assertEqual(first["results"][0]["original_work_id"], "w2")
+            self.assertEqual(first["results"][1]["status"], "prepared_human_review_required")
+            self.add_media("episode2.mp4", "original_video", work_id="w2")
+            resumed = mb.run_batch(self.args(limit=1))
+        self.assertEqual(compare.call_count, 2)
+        self.assertEqual([r["status"] for r in resumed["results"]], ["prepared_human_review_required", "reused_comparison"])
+        self.assertEqual(before, (self.root / "case.json").read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
