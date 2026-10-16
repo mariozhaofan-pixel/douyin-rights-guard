@@ -83,6 +83,23 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(compare.call_count, 2)
         self.assertEqual(second["counts"], {"prepared_human_review_required": 1})
 
+    def test_legacy_comparison_is_regenerated_once_without_losing_old_artifacts(self):
+        self.candidates(local=True)
+        before = (self.root / "case.json").read_bytes()
+        with patch.object(mp, "compare", side_effect=self.compare) as compare:
+            first = mb.run_batch(self.args())
+            state = mb.load_state(self.root)
+            state["items"]["c0"]["comparison"]["fingerprint"].pop("comparison_algorithm_version")
+            cm.atomic_json(self.root / mb.STATE, state)
+            second = mb.run_batch(self.args())
+            third = mb.run_batch(self.args())
+        self.assertEqual(compare.call_count, 2)
+        self.assertEqual(second["counts"], {"prepared_human_review_required": 1})
+        self.assertEqual(third["counts"], {"reused_comparison": 1})
+        self.assertNotEqual(first["results"][0]["report"], second["results"][0]["report"])
+        self.assertTrue((self.root / first["results"][0]["report"]).is_file())
+        self.assertEqual(before, (self.root / "case.json").read_bytes())
+
     def test_cookie_failure_stops_remaining_and_persists(self):
         self.candidates(4)
         with patch.object(mp, "download", side_effect=mp.MediaError("[preflight/cookie_required] stopped")) as fetch:

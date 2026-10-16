@@ -165,6 +165,11 @@ class SyntheticVideoTests(unittest.TestCase):
         cls.encode(["-f", "lavfi", "-i", "color=black:s=192x128:r=10:d=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(cls.black)])
         cls.static = cls.root / "static.mp4"
         cls.encode(["-loop", "1", "-i", str(frames / "000.png"), "-t", "3", "-r", "10", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(cls.static)])
+        cls.compilation = cls.root / "compilation.mp4"
+        # The same six-second opening followed by a long, ineligible static
+        # tail. A small frame budget forces only the long input above 0.5 s
+        # under the former independent sampling rule.
+        cls.encode(["-i", str(cls.original), "-vf", "tpad=stop_mode=clone:stop_duration=24", "-c:v", "libx264", "-crf", "18", str(cls.compilation)])
 
     @classmethod
     def encode(cls, options):
@@ -174,9 +179,9 @@ class SyntheticVideoTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def comparison(self, original, candidate, name, mirror=False):
+    def comparison(self, original, candidate, name, mirror=False, max_frames=100):
         output = self.root / name
-        args = argparse.Namespace(original=str(original), candidate=str(candidate), out=str(output), interval=0.5, max_frames=100, min_run=3, mirror=mirror)
+        args = argparse.Namespace(original=str(original), candidate=str(candidate), out=str(output), interval=0.5, max_frames=max_frames, min_run=3, mirror=mirror)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(media.compare(args), 0)
         return json.loads((output / "comparison.json").read_text(encoding="utf-8")), output
@@ -211,6 +216,30 @@ class SyntheticVideoTests(unittest.TestCase):
         self.assertAlmostEqual(frames[1]["time_seconds"], 0.4, places=5)
         self.assertNotEqual(frames[1]["time_seconds"], info["requested_interval_seconds"])
         self.assertAlmostEqual(info["duration_seconds"], 6.0, places=1)
+
+    def test_unequal_length_copy_survives_sampling_frame_budget(self):
+        for original, candidate, name in ((self.original, self.compilation, "compilation-report"),
+                                          (self.compilation, self.original, "reverse-compilation-report")):
+            with self.subTest(name=name):
+                report, _ = self.comparison(original, candidate, name, max_frames=12)
+                self.assertTrue(report["sequences"], "A copied opening must retain an adjacent run when the longer input hits the sample cap")
+                self.assertEqual(report["algorithm_version"], media.COMPARISON_ALGORITHM_VERSION)
+                self.assertEqual(report["decision"], "human_review_required")
+                shared = report["shared_minimum_interval_seconds"]
+                self.assertGreater(shared, 0.5)
+                self.assertAlmostEqual(shared, 30 / 11, places=4)
+                for side in ("original", "candidate"):
+                    self.assertEqual(report[side]["requested_interval_seconds"], 0.5)
+                    self.assertEqual(report[side]["effective_minimum_interval_seconds"], shared)
+                    self.assertLessEqual(report[side]["sample_count"], 12)
+                best = report["sequences"][0]
+                self.assertGreaterEqual(best["sample_count"], 3)
+                for pair in best["pairs"]:
+                    self.assertAlmostEqual(pair["original_seconds"], pair["candidate_seconds"], places=4)
+                    self.assertLess(pair["original_seconds"], 6)
+                # Report decoded timestamps, not the unachievable 2.727... s
+                # minimum interval on the synthetic source's 10 fps grid.
+                self.assertAlmostEqual(best["pairs"][1]["original_seconds"], 2.8, places=4)
 
 
 if __name__ == "__main__":

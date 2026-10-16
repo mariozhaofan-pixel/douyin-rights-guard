@@ -78,7 +78,8 @@ def comparison_valid(root, record, fingerprint):
 
 def fingerprint_for(original, candidate, args):
     return {"original_sha256": cm.sha256(original), "candidate_sha256": cm.sha256(candidate),
-            "interval": args.interval, "mirror": args.mirror, "max_frames": args.max_frames}
+            "interval": args.interval, "mirror": args.mirror, "max_frames": args.max_frames,
+            "comparison_algorithm_version": mp.COMPARISON_ALGORITHM_VERSION}
 
 
 def run_batch(args):

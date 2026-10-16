@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 NOTICE = "仅为抽样画面相似候选，不是侵权结论；人物、场景、镜头顺序和授权情况须逐段人工复核。未命中不代表没有搬运。"
+COMPARISON_ALGORITHM_VERSION = "shared-interval-v2"
 ROOTS = {"douyin": ("douyin.com", "iesdouyin.com"), "bilibili": ("bilibili.com", "b23.tv"), "kuaishou": ("kuaishou.com",)}
 KS_CDN = ("kuaishou.com", "gifshow.com", "kwaicdn.com", "yximgs.com", "ksapisrv.com")
 
@@ -345,10 +346,10 @@ def mae(a, b):
     return sum(abs(x - y) for x, y in zip(a, b)) / (len(a) * 255)
 
 
-def sample(path, folder, interval, max_frames):
-    info = probe(path)
+def sample(path, folder, interval, max_frames, *, media_info=None, minimum_interval=None):
+    info = media_info if media_info is not None else probe(path)
     # The effective sampling spacing is explicit; original frame rate is separate.
-    spacing = max(interval, info["duration_seconds"] / max_frames)
+    spacing = max(interval, info["duration_seconds"] / (max_frames - 1), minimum_interval or 0)
     folder.mkdir()
     expression = f"setpts=PTS-STARTPTS,select='isnan(prev_selected_t)+gte(t-prev_selected_t,{spacing:.9f})',scale=320:-2,showinfo"
     result = run([binary("ffmpeg"), "-hide_banner", "-nostdin", "-i", str(path), "-map", "0:v:0", "-an", "-vf", expression, "-fps_mode", "vfr", "-frames:v", str(max_frames), str(folder / "frame_%05d.jpg")], timeout=600)
@@ -455,14 +456,20 @@ def compare(args):
     if folder.exists() and any(folder.iterdir()):
         raise MediaError("比对输出目录必须为空，防止覆盖旧报告。")
     folder.mkdir(parents=True, exist_ok=True)
-    left_info, left = sample(left_path, folder / "original-frames", args.interval, args.max_frames)
-    right_info, right = sample(right_path, folder / "candidate-frames", args.interval, args.max_frames)
+    left_media, right_media = probe(left_path), probe(right_path)
+    # Adjacent sequence matching requires the same sampling cadence on both
+    # sides. Independently capped intervals make a copy inside a longer
+    # compilation appear to advance at a different rate and lose every run.
+    shared_interval = max(args.interval, max(left_media["duration_seconds"], right_media["duration_seconds"]) / (args.max_frames - 1))
+    left_info, left = sample(left_path, folder / "original-frames", args.interval, args.max_frames, media_info=left_media, minimum_interval=shared_interval)
+    right_info, right = sample(right_path, folder / "candidate-frames", args.interval, args.max_frames, media_info=right_media, minimum_interval=shared_interval)
     candidates = find_sequences(left, right, args.min_run)
     if args.mirror:
         candidates += find_sequences(left, right, args.min_run, mirrored=True)
     candidates.sort(key=lambda item: (-item["sample_count"], sum(pair["dhash_distance_fraction"] for pair in item["pairs"])))
     candidates = candidates[:12]
     report = {"schema_version": 1, "created_at_utc": stamp(), "notice": NOTICE, "decision": "human_review_required", "method": "256-bit dHash plus grayscale MAE; adjacent ordered sample runs; optional horizontal mirror", "limitations": ["不是人物身份识别、语义场景识别或镜头设计著作权判断。", "未分析音轨；抽样间隔内的内容、裁切、变速、复杂重剪可能漏检。", "黑帧、近白帧、低纹理帧及静态采样点不参与候选序列；不输出高置信侵权标签。", "区间终点是最后一个匹配采样帧，不能代表整个区间逐帧相同。", "必须核对下载文件与页面作品一致，人工核验来源、授权、白名单和合理引用。"], "byte_identical": left_info["sha256"] == right_info["sha256"], "original": left_info, "candidate": right_info, "minimum_adjacent_matches": args.min_run, "sequences": candidates, "original_samples": [public_record(item, folder) for item in left], "candidate_samples": [public_record(item, folder) for item in right], "contact_sheet": "contact-sheet.jpg"}
+    report.update({"algorithm_version": COMPARISON_ALGORITHM_VERSION, "shared_minimum_interval_seconds": shared_interval})
     dump(folder / "comparison.json", report)
     contact_sheet(left, right, candidates, folder / "contact-sheet.jpg")
     summary = ["# 本地视频抽样对照", "", NOTICE, "", f"- 原视频时长：{left_info['duration_seconds']:.3f} 秒；候选视频时长：{right_info['duration_seconds']:.3f} 秒。", f"- 请求采样间隔：{args.interval} 秒；实际最小间隔：原片 {left_info['effective_minimum_interval_seconds']:.6f} 秒，候选 {right_info['effective_minimum_interval_seconds']:.6f} 秒。", f"- 顺序相似候选段：{len(candidates)}；字节完全一致：{report['byte_identical']}（仅文件属性）。", "- 详细真实时间戳、SHA-256、采样排除原因见 comparison.json。", "", "|原作品采样区间（秒）|候选采样区间（秒）|连续采样数|镜像检查|", "|---|---|---|---|"]
