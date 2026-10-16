@@ -326,20 +326,22 @@ python "$SkillDir\scripts\case_manager.py" evidence-add --root "$CaseRoot" --fil
 
 仅将实际获授权的候选 ID 填入列表，再按真实授权更新确认标记和时间。用户已明确授权对指定作品、当前活动平台首批范围内确认搬运的对象批量投诉时，可在实际核验后据该范围整理候选ID列表，并保存原话来源或授权引用；无需为列表内每条再索要确认。后来取消平台时，旧授权引用保留为历史，当前退出范围优先。收到资料、登录授权或泛泛排查请求本身不构成该批授权。超出范围、权属/白名单不明或新增敏感资料去向等重大缺项统一说明，继续不受影响项。
 
+长期授权范围记录保存在私密案件中，具体字段与复用规则见[提交与回执](submission.md)。`submission_authorization.candidate_ids`仍只列实际确认属于该范围的候选，不能用空列表或通配符替代。长期授权不自动满足当前工具另行要求的声明动作确认；此类确认集中成具体批次处理。
+
 ```powershell
 python "$SkillDir\scripts\case_manager.py" gate --root "$CaseRoot" --candidate "$CandidateId"
 ```
 
 `gate` 检查：
 
-- 六项私密资料存在，账号主页截图已登记，作品页和内容管理截图均绑定到当前原作。
+- 版权路线检查六项私密资料、账号主页截图及绑定原作的作品页和内容管理截图；快手明确使用 `general_report` 时不强制这些私密材料与作者截图。
 - 本条提交相关证据哈希一致：全案 `douyin_profile`、绑定当前候选的材料，以及未绑定候选但绑定当前原作的材料。带有其他候选 ID 的材料不因也标注了同一原作 ID 就阻断本候选。
-- 目标在活动平台范围且未被用户退出；环境权限已说明，抖音及目标平台状态为 `authorized`。
-- 身份与权属为 `user_verified`；原作名称、链接与本条原作权属已由用户确认。
+- 目标在活动平台范围且未被用户退出；环境权限已说明，目标平台检索举报账号具有对应授权。作者标识无需登录授权；新案件使用 `account_roles`，旧案仅兼容既有目标平台授权。
+- 权属为 `user_verified`，版权路线另检查身份状态；原作名称、链接与本条原作权属已由用户确认。
 - 具有与原作 ID 关联的 `original_video`；`local_video` 模式另须绑定候选的 `candidate_video`，明确选择 `browser_visual` 时改查上述官方页面、两镜头四点截图及对照图。
 - 白名单已明确确认，条目有平台与账号 ID；候选 ID 已核对，不属于白名单或对应平台的本人账号。
 - `local_video` 至少一个具体连续重复区段已通过实际视觉复核；`browser_visual` 须按上文核验两镜头四点并明确取样局限。`manual_review` 的复核者为真实的 `user` 或受托查看证据的 `agent`，本条候选仍须在已记录用户提交授权内；算法输出本身不满足复核。
-- 候选的 `complaint_channel_review.status` 为 `verified`、`infringement_entry_verified` 为 `true`，且 `observed_path` 为非空的有效字符串数组；任一缺失或未核验返回 `complaint_channel_not_verified`。实际侵权入口之后选择搬运的核验不能由目标授权或相似度判断代替。
+- 候选的 `complaint_channel_review.status` 为 `verified`，且 `observed_path` 为非空的有效字符串数组；版权路线另须 `infringement_entry_verified=true`，快手 `general_report` 不要求侵权入口标记。实际通道核验不能由目标授权或相似度判断代替。
 - 规范 URL 与平台和视频 ID 一致，候选的 `submission_status` 仍为 `not_submitted`。
 
 通过返回 `ready_for_submission_review`，同时明确 `network_submission_performed: false`；有缺项返回 `blocked` 和原因代码。当前提交不引用的其他作品、其他候选或未关联搜索资料发生丢失/变更时，在 `warnings` 中给出 `unrelated_evidence_integrity_failed`、证据 ID 和状态，不阻断当前候选。`verify` 与 `status.evidence_integrity` 仍报告全案完整性，因此它们可能提示异常而当前 `gate` 仅有警告。处理警告时保留原证据登记，不把它当成可以删除问题记录的理由。通过只是供实际提交复核，不能替代官方表单检查或真实的身份、权属和证据判断。
