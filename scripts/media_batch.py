@@ -97,7 +97,8 @@ def run_batch(args):
     checks = cm.verify_evidence(root)["evidence"]
     results, attempts = [], 0
     cookie_streak = Counter(state["cookie_streak"])
-    for candidate in candidates:
+    priority = {"douyin": 0, "bilibili": 1, "kuaishou": 2}
+    for candidate in sorted(candidates, key=lambda c: priority.get(c.get("platform"), 3)):
         cid, platform = candidate.get("candidate_id"), candidate.get("platform")
         if selected and cid not in selected:
             continue

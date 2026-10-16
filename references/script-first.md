@@ -73,6 +73,8 @@ python "$SkillDir\scripts\workflow.py" import-search --root "$CaseRoot" --file "
 
 `first`需要实际官方来源页与边界记录；纯分享文本只能 `links`。后续滚动用 `extension --parent-batch ks-first-01`，不修改原首批分母。`--original-id`只对已存在原作建候选；全系列结果不应一律绑第1集，不能确定对应集时先不传，复核后关联。输入中的“已复核/已授权/已提交”等字段不被采信。
 
+官方搜索页正常加载并明确显示零结果时，可用 `{"results":[],"observed_empty":true}` 配合 `first`、实际来源页和边界记录，保留真实的零结果批次。普通空数组、空文本、公开索引失败、登录限制或未加载页面不能这样登记。该记录只描述本次页面，不表示全网没有搬运。
+
 快手新候选默认工作流选择 `general_report`；抖音/B站使用 `copyright`。既有候选的旧路线、权属、回执不自动覆盖，避免重新统计或误重投。
 
 ## 3. 批量媒体准备与续跑
@@ -109,6 +111,8 @@ python "$SkillDir\scripts\workflow.py" report --root "$CaseRoot"
 ```
 
 `plan`输出待解析、待关联原作、缺项、可以进官方表单复核或应先查回执的清单。`prepare`按内容指纹输出 `06_drafts/workflow/<指纹>/`，每候选Markdown草稿、JSON附件引用、缺项以及按平台/路线/原作分组的目标清单。它不复制附件、不读入身份副本、不发送邮件、不提交举报；生成草稿也不代表门槛通过。已有相同包经完整性检查可复用。
+
+`plan`与`prepare`按抖音、B站、快手排序，并输出 `execution_priority`。抖音待解析、待核、证据不足及结果未知分别保留原因；证据不足不改写为未处理或已完成。站外草稿仍可生成，`prerequisites_ready_for_official_form`表示材料检查状态，`submission_deferred_by_platform_order`表示提交顺序等待；等待项不进入 `ready_target_links_text`。抖音 `submitted` 仅剩审核跟进时不延后站外；历史已提交目标不重投。没有任何抖音范围记录会提示 `scope_not_recorded`，应补记真实检索状态；这不是新增用户审批。`case_manager gate`仍只检查材料与已有授权，顺序由工作流输出区分。
 
 抖音同一原作的目标链接可分组填官方批量表单；平台识别丢弃或重复的链接单记，不按输入数计成功。B站同一UP主有多条已核实搬运、原作材料适用的稿件时，可使用“批量投诉更多”（实测最多50个）；它不支持跨UP主混批，其他情况逐条处理。逐项保留目标ID和回执关联，不把弹窗中未复核作品加入投诉。快手默认使用网页普通举报，优先简洁理由加原作链接，只选择真实适用分类，不为凑数量捏造违规类型；不强制手机或邮件。
 

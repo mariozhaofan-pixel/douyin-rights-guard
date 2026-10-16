@@ -398,5 +398,105 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(plan["next_steps"][0]["action"], "excluded_after_recorded_human_review")
         self.assertNotEqual(plan["next_steps"][1]["action"], "excluded_after_recorded_human_review")
         self.assertEqual(wf.prepare(self.root, self.case)["prepared"], 2)
+
+    def ready_segments(self):
+        for candidate in self.case["candidates"]:
+            candidate["overlap_segments"] = [{"original_start": 1, "original_end": 3,
+                "candidate_start": 1, "candidate_end": 3, "description": "Synthetic copied motion", "human_verified": True}]
+
+    def test_priority_orders_mixed_queue_and_defers_submission_without_blocking_preparation(self):
+        ks_id = self.add_candidate("ks789", platform="kuaishou")
+        bili_id = self.add_candidate("BV1abc456", platform="bilibili")
+        dy_id = self.add_candidate()
+        self.ready_segments()
+        before = json.dumps(self.case, sort_keys=True)
+        with mock.patch.object(cm, "gate", return_value={"status": "ready_for_submission_review", "reasons": []}):
+            plan = wf.plan(self.root, self.case)
+            result = wf.prepare(self.root, self.case)
+            singled = wf.prepare(self.root, self.case, bili_id)
+        self.assertEqual([s["candidate_id"] for s in plan["next_steps"]], [dy_id, bili_id, ks_id])
+        self.assertTrue(plan["next_steps"][0]["ready_to_submit"])
+        for step in plan["next_steps"][1:]:
+            self.assertFalse(step["ready_to_submit"])
+            self.assertTrue(step["local_preparation_allowed"])
+            self.assertTrue(step["prerequisites_ready_for_official_form"])
+        summary = cm.read_json(self.root / result["folder"] / "summary.json")
+        self.assertEqual([s["candidate_id"] for s in summary["prepared"]], [dy_id, bili_id, ks_id])
+        self.assertEqual(len(summary["prepared"]), 3)
+        for group in summary["link_groups"][1:]:
+            self.assertEqual(group["ready_target_links_text"], "")
+            self.assertTrue(group["blocked_targets"][0]["submission_deferred_by_platform_order"])
+        single_data = cm.read_json(self.root / singled["folder"] / (bili_id + ".json"))
+        self.assertTrue(single_data["submission_deferred_by_platform_order"])
+        self.assertTrue(single_data["prerequisites_ready_for_official_form"])
+        self.assertEqual(single_data["missing_requirements"], [])
+        self.assertEqual(before, json.dumps(self.case, sort_keys=True))
+
+    def test_submitted_douyin_does_not_delay_off_platform_work_or_trigger_resubmission(self):
+        bili_id = self.add_candidate("BV1abc456", platform="bilibili")
+        dy_id = self.add_candidate()
+        self.ready_segments()
+        dy = self.case["candidates"][-1]
+        dy["submission_status"] = "submitted"
+        dy["review_status"] = "pending"
+        with mock.patch.object(cm, "gate", return_value={"status": "ready_for_submission_review", "reasons": []}) as gate:
+            plan = wf.plan(self.root, self.case)
+            result = wf.prepare(self.root, self.case)
+        self.assertFalse(plan["execution_priority"]["off_platform_submission_deferred"])
+        self.assertEqual(plan["next_steps"][0]["candidate_id"], bili_id)
+        self.assertTrue(plan["next_steps"][0]["ready_to_submit"])
+        self.assertEqual(plan["next_steps"][-1]["action"], "check_official_review_and_removal_result")
+        self.assertTrue(all(call.args[2] != dy_id for call in gate.call_args_list))
+        summary = cm.read_json(self.root / result["folder"] / "summary.json")
+        self.assertEqual(summary["link_groups"][0]["ready_target_links_text"], "https://www.bilibili.com/video/BV1abc456")
+        self.assertEqual(result["prepared"], 1)
+
+    def test_unresolved_and_unknown_douyin_work_remain_pending_with_specific_reasons(self):
+        bili_id = self.add_candidate("BV1abc456", platform="bilibili")
+        self.add_candidate()
+        dy = self.case["candidates"][-1]
+        wf.import_search(self.root, self.case, self.args(rows=[{"url": "https://v.douyin.com/unknown/"}]))
+        dy["manual_review"].update(status="insufficient_evidence", reviewer="agent", reviewed_at=cm.now())
+        priority = wf.execution_priority(self.root, self.case)
+        self.assertEqual({s["reason"] for s in priority["pending_items"]},
+                         {"unresolved_search_item", "reviewed_insufficient_evidence"})
+        self.assertTrue(priority["preparation_allowed"])
+        for state in ("unknown", "submitting"):
+            dy["submission_status"] = state
+            self.assertIn("submission_result_requires_verification",
+                          [s["reason"] for s in wf.execution_priority(self.root, self.case)["pending_items"]])
+            with mock.patch.object(cm, "gate", return_value={"status": "ready_for_submission_review", "reasons": []}):
+                result = wf.prepare(self.root, self.case, bili_id)
+            self.assertTrue(result["execution_priority"]["off_platform_submission_deferred"])
+
+    def test_douyin_excluded_or_inactive_does_not_block_off_platform(self):
+        self.add_candidate("BV1abc456", platform="bilibili")
+        self.assertEqual(wf.execution_priority(self.root, self.case)["douyin_stage"], "scope_not_recorded")
+        self.add_candidate()
+        dy = self.case["candidates"][-1]
+        dy["manual_review"].update(status="not_copy", reviewer="agent", reviewed_at=cm.now())
+        self.assertFalse(wf.execution_priority(self.root, self.case)["off_platform_submission_deferred"])
+        dy["manual_review"]["reviewed_at"] = None
+        self.assertTrue(wf.execution_priority(self.root, self.case)["off_platform_submission_deferred"])
+        cm.platform_withdraw(self.root, self.case, "douyin")
+        self.assertFalse(wf.execution_priority(self.root, self.case)["off_platform_submission_deferred"])
+
+    def test_explicit_observed_empty_first_batch_can_record_zero_results(self):
+        args = self.args(rows=[])
+        with self.assertRaises(cm.CaseError):
+            wf.import_search(self.root, self.case, args)
+        Path(args.file).write_text(json.dumps({"results": [], "observed_empty": True}), encoding="utf-8")
+        args.batch_kind = "links"
+        with self.assertRaisesRegex(cm.CaseError, "official_first_batch"):
+            wf.import_search(self.root, self.case, args)
+        args.batch_kind = "first"
+        args.source_url = None
+        with self.assertRaisesRegex(cm.CaseError, "source_and_boundary"):
+            wf.import_search(self.root, self.case, args)
+        args.source_url = "https://www.douyin.com/search/test"
+        result = wf.import_search(self.root, self.case, args)
+        self.assertEqual(result["denominator"], 0)
+        self.assertEqual(wf.execution_priority(self.root, self.case)["douyin_stage"], "no_recorded_pending_work")
+        self.assertFalse(wf.execution_priority(self.root, self.case)["off_platform_submission_deferred"])
 if __name__ == "__main__":
     unittest.main()

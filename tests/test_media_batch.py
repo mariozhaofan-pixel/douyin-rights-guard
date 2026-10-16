@@ -165,6 +165,23 @@ class BatchTests(unittest.TestCase):
         fetch.assert_not_called()
         self.assertEqual(report["counts"], {"original_media_missing_or_ambiguous": 1})
 
+    def test_media_limit_prioritizes_douyin_then_bilibili_without_reordering_case(self):
+        self.candidates(3, local=True)
+        for candidate, platform, video_id in zip(self.case["candidates"],
+                ("kuaishou", "bilibili", "douyin"), ("ks1000", "BV1abc1001", "1002")):
+            candidate.update(platform=platform, video_id=video_id, canonical_url=cm.canonical_url(platform, video_id))
+        cm.atomic_json(self.root / "case.json", self.case)
+        before = (self.root / "case.json").read_bytes()
+        with patch.object(mp, "compare", side_effect=self.compare) as compare:
+            first = mb.run_batch(self.args(limit=1))
+            second = mb.run_batch(self.args(limit=1))
+        self.assertEqual([r["candidate_id"] for r in first["results"]], ["c2", "c1", "c0"])
+        self.assertEqual(first["results"][0]["status"], "prepared_human_review_required")
+        self.assertEqual([r["status"] for r in second["results"]],
+                         ["reused_comparison", "prepared_human_review_required", "deferred_by_limit"])
+        self.assertEqual(compare.call_count, 2)
+        self.assertEqual(before, (self.root / "case.json").read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()

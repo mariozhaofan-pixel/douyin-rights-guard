@@ -20,7 +20,7 @@ except ModuleNotFoundError:  # Support loading this file with importlib in tests
     cm = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(cm)
 
-PLATFORMS = ("douyin", "kuaishou", "bilibili")
+PLATFORMS = ("douyin", "bilibili", "kuaishou")
 BATCH_FOLDER = "03_search/workflow"
 RESOLUTIONS = "03_search/workflow-resolutions.json"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -118,19 +118,21 @@ def load_rows(path):
         raise cm.CaseError("input_exceeds_10_mib")
     content = path.read_text(encoding="utf-8-sig")
     suffix = path.suffix.lower()
+    observed_empty = False
     if suffix == ".json":
         try:
             data = json.loads(content)
         except ValueError:
             raise cm.CaseError("invalid_search_json") from None
         rows = data.get("results") if isinstance(data, dict) else data
+        observed_empty = isinstance(data, dict) and data.get("observed_empty") is True
     elif suffix == ".csv":
         rows = list(csv.DictReader(io.StringIO(content)))
     elif suffix == ".txt":
         rows = [{"url": match.group()} for match in URL_RE.finditer(content)]
     else:
         raise cm.CaseError("search_input_requires_json_csv_or_txt")
-    if not isinstance(rows, list) or not rows or len(rows) > MAX_ROWS:
+    if not isinstance(rows, list) or (not rows and not observed_empty) or len(rows) > MAX_ROWS:
         raise cm.CaseError("search_rows_must_contain_1_to_5000_entries")
     return rows, suffix[1:]
 
@@ -227,6 +229,8 @@ def import_search(root, case, args):
     origin = source_url(args.source_url, args.platform)
     if args.batch_kind == "first" and (not origin or not args.boundary_note):
         raise cm.CaseError("first_batch_requires_observed_source_and_boundary")
+    if not rows and args.batch_kind != "first":
+        raise cm.CaseError("observed_empty_requires_official_first_batch")
     batches = load_batches(root)
     if args.batch_kind == "extension":
         parents = [b for b in batches if b["batch_id"] == args.parent_batch]
@@ -258,6 +262,8 @@ def import_search(root, case, args):
                 "parent_batch": args.parent_batch, "input_format": fmt,
                 "source_sha256": cm.sha256(path), "original_work_id": args.original_id,
                 "requested_complaint_route": route}
+    if not rows:
+        identity["observed_empty"] = True
     fingerprint = digest(identity)
     target = cm.member(root, BATCH_FOLDER + "/" + args.batch_id + ".json")
     if target.exists():
@@ -304,6 +310,47 @@ def reviewed_exclusion(candidate):
     review = candidate.get("manual_review", {})
     return (review.get("status") in ("not_copy", "unrelated_or_shared_material", "excluded")
             and review.get("reviewer") in ("user", "agent") and bool(review.get("reviewed_at")))
+
+
+def platform_priority(item):
+    platform = item.get("platform")
+    return PLATFORMS.index(platform) if platform in PLATFORMS else len(PLATFORMS)
+
+
+def execution_priority(root, case):
+    """Derive scheduling from recorded work, never add authorization or case state."""
+    if "douyin" not in cm.platform_scope(case)["active_platforms"]:
+        return {"platform_order": list(PLATFORMS), "douyin_stage": "not_in_active_scope",
+                "off_platform_submission_deferred": False, "pending_items": [], "preparation_allowed": True}
+    index = candidate_index(case)
+    resolutions = load_resolutions(root)
+    pending, seen = [], set()
+    douyin_batches = [b for b in load_batches(root) if b["platform"] == "douyin"]
+    douyin_candidates = [c for c in case.get("candidates", []) if c.get("platform") == "douyin"]
+    for batch in douyin_batches:
+        for original_row in batch["entries"]:
+            row = effective_entry(batch, original_row, resolutions)
+            if row["key"] not in index and row["key"] not in seen:
+                seen.add(row["key"])
+                pending.append({"batch_id": batch["batch_id"], "item_key": row["key"],
+                                "reason": "unresolved_search_item" if row["resolution_status"] != "resolved" else "unregistered_search_item"})
+    for candidate in douyin_candidates:
+        state = candidate.get("submission_status")
+        if state == "submitted" or state == "not_submitted" and reviewed_exclusion(candidate):
+            continue
+        review = candidate.get("manual_review", {})
+        reviewed = review.get("reviewer") in ("user", "agent") and bool(review.get("reviewed_at"))
+        reason = ("submission_result_requires_verification" if state in ("unknown", "submitting") else
+                  "reviewed_insufficient_evidence" if reviewed and review.get("status") in ("insufficient", "insufficient_evidence") else
+                  "confirmed_copy_not_submitted" if reviewed and review.get("status") == "confirmed_copy" else
+                  "pending_review_or_existing_record")
+        pending.append({"candidate_id": candidate["candidate_id"], "reason": reason})
+    recorded = bool(douyin_batches or douyin_candidates)
+    return {"platform_order": list(PLATFORMS),
+            "douyin_stage": "recorded_work_pending" if pending else "no_recorded_pending_work" if recorded else "scope_not_recorded",
+            "off_platform_submission_deferred": bool(pending) or not recorded,
+            "pending_items": pending, "preparation_allowed": True,
+            "note": "只描述已有清单；证据不足保留具体待办，站外可继续本地准备。已提交待审核不阻塞站外；没有待办不证明搜索覆盖已完整。"}
 
 
 def next_step(root, case, candidate):
@@ -373,12 +420,26 @@ def plan(root, case):
             row = effective_entry(batch, original_row, resolutions)
             if row["key"] not in index and row["key"] not in queued:
                 queued.add(row["key"])
-                tasks.append({"batch_id": batch["batch_id"], "item_key": row["key"],
+                tasks.append({"batch_id": batch["batch_id"], "item_key": row["key"], "platform": batch["platform"],
                               "action": "resolve_official_work_url" if row["resolution_status"] != "resolved" else "register_candidate_with_correct_original",
                               "ready_to_submit": False})
     tasks += [{"candidate_id": c["candidate_id"], "platform": c["platform"], **next_step(root, case, c)}
               for c in case.get("candidates", [])]
-    return {**data, "next_steps": tasks,
+    priority = execution_priority(root, case)
+    for task in tasks:
+        task["submission_deferred_by_platform_order"] = bool(priority["off_platform_submission_deferred"]
+            and task["platform"] in ("bilibili", "kuaishou") and task["platform"] in active
+            and task["action"] in ("official_form_review", "complete_missing_review_or_evidence",
+                                   "resolve_official_work_url", "register_candidate_with_correct_original"))
+        if task["submission_deferred_by_platform_order"]:
+            task["local_preparation_allowed"] = True
+            task["prerequisites_ready_for_official_form"] = task["ready_to_submit"]
+            task["ready_to_submit"] = False
+            if task["action"] == "official_form_review":
+                task["action"] = "await_douyin_stage_before_official_submission"
+    tasks.sort(key=lambda task: (task["action"] in ("check_official_review_and_removal_result",
+                "inactive_platform_preserve_history", "excluded_after_recorded_human_review"), platform_priority(task)))
+    return {**data, "execution_priority": priority, "next_steps": tasks,
             "account_reminder": "只登录用户授权的非作者检索/举报操作账号；作者主页、作品与创作者中心证明全部复用用户提供截图，不要求作者账号登录。操作账号不同不改变权利人身份，也不代替平台要求的代理授权。"}
 
 
@@ -455,6 +516,8 @@ def grouped_links(prepared):
                                        "original_url": item["original_url"], "ready_targets": [], "blocked_targets": []})
         target = {"candidate_id": item["candidate_id"], "target_url": item["target_url"],
                   "ready_for_official_form_review": item["ready_for_official_form_review"],
+                  "prerequisites_ready_for_official_form": item["prerequisites_ready_for_official_form"],
+                  "submission_deferred_by_platform_order": item["submission_deferred_by_platform_order"],
                   "missing_requirements": item["missing_requirements"]}
         group["ready_targets" if target["ready_for_official_form_review"] else "blocked_targets"].append(target)
     for group in groups.values():
@@ -479,6 +542,7 @@ def verify_handoff(folder, fingerprint, expected_files):
 
 def prepare(root, case, candidate_id=None):
     active = cm.platform_scope(case)["active_platforms"]
+    priority = execution_priority(root, case)
     candidates = case.get("candidates", [])
     if candidate_id:
         candidates = [c for c in candidates if c.get("candidate_id") == candidate_id]
@@ -487,7 +551,7 @@ def prepare(root, case, candidate_id=None):
         if candidates[0].get("platform") not in active:
             raise cm.CaseError("candidate_platform_not_active")
     prepared, skipped = [], []
-    for candidate in candidates:
+    for candidate in sorted(candidates, key=platform_priority):
         candidate_id = identifier(candidate.get("candidate_id"), "candidate_id")
         if candidate.get("platform") not in active:
             skipped.append({"candidate_id": candidate_id, "reason": "inactive_platform"})
@@ -515,7 +579,9 @@ def prepare(root, case, candidate_id=None):
             missing.append("canonical_original_url_not_resolved")
         if not material["segments"] and not material["points"]:
             missing.append("draft_specific_evidence_not_available_in_current_schema")
-        ready = step["ready_to_submit"] and not missing
+        prerequisites_ready = step["ready_to_submit"] and not missing
+        deferred = priority["off_platform_submission_deferred"] and candidate["platform"] != "douyin"
+        ready = prerequisites_ready and not deferred
         title = "普通举报准备草稿" if route == "general_report" else "版权投诉准备草稿"
         privacy_note = ("本次普通举报准备包不包含身份材料；只使用当前表单实际要求的最小必要内容。"
                         if route == "general_report" else "本文件无身份填表副本；身份材料只在官方表单内按必要范围填写。")
@@ -527,7 +593,9 @@ def prepare(root, case, candidate_id=None):
                    "- 原作：" + (original_url or original_link.get("source_url", "待补充可定位原作链接")),
                    "- 原作标题：" + safe_text(original.get("title", "待补充"), 1000),
                    "- 人工复核：" + ("已有人工确认记录，具体已核实点与局限见下方。" if confirmed else "尚无完整人工确认记录，不可据此认定搬运或提交。"),
-                   "- 提交前本地检查：" + ("可进入官方表单复核。" if ready else "未通过；见 missing_requirements。"),
+                   "- 提交前本地检查：" + ("已满足材料检查；等待抖音阶段后再提交，仍可继续本地准备。" if prerequisites_ready and deferred else
+                                           "可进入官方表单复核。" if ready else "未通过；见 missing_requirements。"),
+                   "- 平台执行顺序：抖音 → B站/快手；" + ("当前站外提交待抖音阶段续办，本地准备不受禁止。" if deferred else "按已记录状态继续。"),
                    "", "## 实际已核实的重合点"]
         for segment in material["segments"]:
             content.append(f"- 连续片段：原作 {segment['original_start']}–{segment['original_end']} 秒；目标 {segment['candidate_start']}–{segment['candidate_end']} 秒。{segment['description']}")
@@ -550,29 +618,31 @@ def prepare(root, case, candidate_id=None):
         prepared.append({"candidate_id": candidate_id, "platform": candidate["platform"], "complaint_route": route,
                          "original_work_id": safe_text(candidate.get("original_work_id", ""), 100), "original_url": original_url,
                          "target_url": target_url, "draft": "\n".join(content) + "\n",
+                         "prerequisites_ready_for_official_form": prerequisites_ready,
+                         "submission_deferred_by_platform_order": deferred,
                          "ready_for_official_form_review": ready, "reviewed_material": material,
                          "missing_requirements": list(dict.fromkeys(missing)), "attachments": attachment_refs(root, candidate)})
     groups = grouped_links(prepared)
-    fingerprint = digest({"prepared": prepared, "skipped": skipped, "link_groups": groups})[:20]
+    fingerprint = digest({"prepared": prepared, "skipped": skipped, "link_groups": groups, "execution_priority": priority})[:20]
     relative = "06_drafts/workflow/" + fingerprint
     folder = cm.member(root, relative)
     expected_files = ["summary.json", *[item["candidate_id"] + suffix for item in prepared for suffix in (".md", ".json")]]
     if folder.exists():
         verify_handoff(folder, fingerprint, expected_files)
-        return {"status": "already_prepared", "integrity_verified": True, "folder": relative, "prepared": len(prepared), "skipped": len(skipped), "network_submission_performed": False}
+        return {"status": "already_prepared", "integrity_verified": True, "folder": relative, "prepared": len(prepared), "skipped": len(skipped), "execution_priority": priority, "network_submission_performed": False}
     folder.mkdir(parents=True)
     for item in prepared:
         (folder / (item["candidate_id"] + ".md")).write_text(item.pop("draft"), encoding="utf-8")
         cm.atomic_json(folder / (item["candidate_id"] + ".json"), item)
     summary = {"notice": NOTICE, "created_at": cm.now(), "network_submission_performed": False,
                "attachments_copied": False, "private_intake_copied": False,
-               "prepared": prepared, "skipped": skipped,
+               "prepared": prepared, "skipped": skipped, "execution_priority": priority,
                "link_groups": groups,
                "by_platform": {p: [item["candidate_id"] for item in prepared if item["platform"] == p] for p in PLATFORMS}}
     cm.atomic_json(folder / "summary.json", summary)
     cm.atomic_json(folder / "artifact-manifest.json", {"schema_version": 1, "content_fingerprint": fingerprint,
                    "files": {name: cm.sha256(folder / name) for name in expected_files}})
-    return {"status": "prepared", "folder": relative, "prepared": len(prepared), "skipped": len(skipped), "network_submission_performed": False}
+    return {"status": "prepared", "folder": relative, "prepared": len(prepared), "skipped": len(skipped), "execution_priority": priority, "network_submission_performed": False}
 
 
 def parser():
