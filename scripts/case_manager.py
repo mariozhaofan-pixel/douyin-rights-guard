@@ -20,6 +20,9 @@ DIRECTORIES = (
 )
 PLATFORMS = ("douyin", "kuaishou", "bilibili", "xiaohongshu")
 DEFAULT_ACTIVE_PLATFORMS = ("douyin", "kuaishou", "bilibili")
+ACCOUNT_ROLES = ("author", "reporter")
+ACCOUNT_SCOPES = {"author": (), "reporter": ("search", "report")}
+COMPLAINT_ROUTES = ("copyright", "general_report")
 EVIDENCE_KINDS = (
     "douyin_profile", "douyin_work", "douyin_creator_center",
     "original_video", "candidate_video", "candidate_page", "candidate_frame",
@@ -129,6 +132,7 @@ def init_case(root_value: str):
         "full_access_acknowledged": False,
         "platform_scope": {"active_platforms": list(DEFAULT_ACTIVE_PLATFORMS), "withdrawals": {}},
         "authorizations": {p: {"status": "pending", "account_id": "", "authorized_at": None} for p in PLATFORMS},
+        "account_roles": {},
         "rights_review": {"identity_status": "pending", "ownership_status": "pending", "reviewed_at": None},
         "works": [],
         "whitelist": {"user_confirmed": False, "confirmed_at": None, "entries": []},
@@ -200,12 +204,196 @@ def status(root: Path, case):
             for work in case.get("works", []) if isinstance(work, dict) and work.get("work_id")
         },
         "authorizations": {p: case.get("authorizations", {}).get(p, {}).get("status", "pending") for p in PLATFORMS},
+        "accounts": accounts(case),
         "platform_scope": platform_scope(case),
         "work_count": len(case.get("works", [])),
         "candidate_count": len(case.get("candidates", [])),
         "whitelist_confirmed": case.get("whitelist", {}).get("user_confirmed") is True,
         "evidence_integrity": verification["ok"],
     }
+
+
+def account_registry(case):
+    """Validate optional role metadata without migrating or rewriting legacy cases."""
+    registry = case.get("account_roles", {})
+    if not isinstance(registry, dict) or any(p not in PLATFORMS for p in registry):
+        raise CaseError("invalid_account_roles")
+    for platform, entry in registry.items():
+        if not isinstance(entry, dict):
+            raise CaseError("invalid_account_roles")
+        own_ids = entry.get("known_own_account_ids", [])
+        history = entry.get("history", [])
+        if (not isinstance(own_ids, list) or any(not valid_account_id(value) for value in own_ids)
+                or not isinstance(history, list)):
+            raise CaseError("invalid_account_roles")
+        records = [(role, entry[role]) for role in ACCOUNT_ROLES if role in entry]
+        for record in history:
+            if not isinstance(record, dict) or record.get("role") not in ACCOUNT_ROLES:
+                raise CaseError("invalid_account_roles")
+            records.append((record["role"], record))
+        for role, record in records:
+            if (not isinstance(record, dict) or not valid_account_id(record.get("account_id"))
+                    or record.get("status") not in (("identified",) if role == "author" else ("pending", "authorized"))
+                    or not isinstance(record.get("own_account"), bool)
+                    or not isinstance(record.get("authorized_scopes"), list)
+                    or any(scope not in ACCOUNT_SCOPES[role] for scope in record["authorized_scopes"])
+                    or (record["status"] == "authorized" and
+                        (not record["authorized_scopes"] or not valid_account_timestamp(record.get("authorized_at"))))
+                    or (record["status"] in ("pending", "identified") and
+                        (record["authorized_scopes"] or record.get("authorized_at")))):
+                raise CaseError("invalid_account_roles")
+    return registry
+
+
+def valid_account_id(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", value) is not None
+
+
+def valid_account_timestamp(value):
+    try:
+        return isinstance(value, str) and datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def effective_account(case, platform, role):
+    """Explicit role records override legacy permission for that role only."""
+    entry = account_registry(case).get(platform, {})
+    if role in entry:
+        return {**entry[role], "source": "role_registration"}
+    # Only the legacy Douyin login identified the original author's account.
+    # This is an identity hint for exclusions, never a new login requirement.
+    if role == "author" and platform != "douyin":
+        return {"status": "missing", "account_id": "", "authorized_scopes": [], "source": "missing"}
+    # A role-aware platform must name its reporter rather than inheriting the
+    # former author login as permission to perform reports.
+    if role == "reporter" and entry:
+        return {"status": "missing", "account_id": "", "authorized_scopes": [], "source": "missing"}
+    legacy = case.get("authorizations", {}).get(platform, {})
+    if role == "author":
+        return {"account_id": legacy.get("account_id", ""), "status": "identified" if legacy.get("account_id") else "missing",
+                "authorized_at": None, "authorized_scopes": [], "source": "legacy_authorization"}
+    return {"account_id": legacy.get("account_id", ""), "status": legacy.get("status", "pending"),
+            "authorized_at": legacy.get("authorized_at"), "authorized_scopes": list(ACCOUNT_SCOPES[role])
+            if legacy.get("status") == "authorized" else [], "source": "legacy_authorization"}
+
+
+def known_own_account_ids(case, platform):
+    """Keep original and previously registered own accounts excluded after switches."""
+    entry = account_registry(case).get(platform, {})
+    legacy = case.get("authorizations", {}).get(platform, {}).get("account_id")
+    result = {str(legacy)} if legacy else set()
+    result.update(entry.get("known_own_account_ids", []))
+    for role in ACCOUNT_ROLES:
+        record = entry.get(role, {})
+        if record.get("account_id") and (role == "author" or record.get("own_account") is True):
+            result.add(record["account_id"])
+    for record in entry.get("history", []):
+        if record.get("role") == "author" or record.get("own_account") is True:
+            result.add(record["account_id"])
+    return result
+
+
+def accounts(case):
+    """Redacted readiness report: role grants do not establish copyright ownership."""
+    result = {}
+    for platform in PLATFORMS:
+        author = effective_account(case, platform, "author")
+        reporter = effective_account(case, platform, "reporter")
+        issues = []
+        if not reporter.get("account_id"):
+            issues.append("reporter_account_missing")
+        if reporter.get("source") == "legacy_authorization":
+            issues.append("legacy_roles_not_separated")
+        for scope in ("search", "report"):
+            if reporter.get("status") != "authorized" or scope not in reporter.get("authorized_scopes", []):
+                issues.append("reporter_" + scope + "_authorization_pending")
+        same_account = bool(author.get("account_id")) and author.get("account_id") == reporter.get("account_id")
+        if same_account:
+            issues.append("consider_non_author_reporter_for_search_visibility")
+        result[platform] = {
+            "author": {"status": author["status"], "source": author["source"],
+                       "authorized_scopes": author["authorized_scopes"]},
+            "reporter": {"status": reporter["status"], "source": reporter["source"],
+                         "authorized_scopes": reporter["authorized_scopes"]},
+            "same_account": same_account, "known_own_account_count": len(known_own_account_ids(case, platform)),
+            "issues": issues,
+        }
+    return {"platforms": result, "network_submission_performed": False,
+            "notice": "The user supplies author screenshots; no author login is required. Prefer a separately authorized non-author account for search and reports when the official channel permits it. Login roles never establish the claimant's identity or ownership. Existing reporter grants can be recorded without repeating user confirmation."}
+
+
+def account_set(root: Path, case, args):
+    """Record an existing user grant, not a login operation or a new grant request."""
+    if args.platform not in PLATFORMS or args.role not in ACCOUNT_ROLES:
+        raise CaseError("invalid_account_platform_or_role")
+    if not valid_account_id(args.account_id):
+        raise CaseError("account_id_must_be_stable_id_not_url_or_nickname")
+    scopes = list(dict.fromkeys(args.scope or []))
+    if args.role == "author" and (args.authorized or scopes):
+        raise CaseError("author_is_identifier_only_no_login_authorization_required")
+    if any(scope not in ACCOUNT_SCOPES[args.role] for scope in scopes):
+        raise CaseError("scope_not_allowed_for_account_role")
+    if bool(args.authorized) != bool(scopes):
+        raise CaseError("authorized_requires_explicit_scopes_and_scopes_require_authorized")
+    registry = account_registry(case)
+    entry = registry.setdefault(args.platform, {"known_own_account_ids": [], "history": []})
+    previous = entry.get(args.role)
+    timestamp = now()
+    if previous:
+        entry.setdefault("history", []).append({**previous, "role": args.role, "superseded_at": timestamp})
+    record = {"account_id": args.account_id, "status": "identified" if args.role == "author" else ("authorized" if args.authorized else "pending"),
+              "authorized_scopes": scopes, "authorized_at": timestamp if args.authorized else None,
+              "own_account": bool(args.own_account), "registered_at": timestamp}
+    entry[args.role] = record
+    if args.own_account and args.account_id not in entry.setdefault("known_own_account_ids", []):
+        entry["known_own_account_ids"].append(args.account_id)
+    case["account_roles"] = registry
+    atomic_json(root / "case.json", case)
+    return {"status": "account_role_recorded", "platform": args.platform, "role": args.role,
+            "authorization_status": record["status"], "authorized_scopes": scopes,
+            "account_switched": bool(previous and previous["account_id"] != args.account_id),
+            "submission_history_preserved": True, "network_submission_performed": False}
+
+
+def account_gate(case, candidate):
+    platform = candidate.get("platform")
+    reasons, warnings = [], []
+    if platform not in PLATFORMS:
+        return ["platform_authorization_pending_or_blocked"], []
+    reporter = effective_account(case, platform, "reporter")
+    if reporter.get("source") == "role_registration" or reporter.get("source") == "missing":
+        if not reporter.get("account_id"):
+            reasons.append("reporter_account_missing")
+        if reporter.get("status") != "authorized" or "report" not in reporter.get("authorized_scopes", []):
+            reasons.append("reporter_report_authorization_pending")
+            reasons.append("platform_authorization_pending_or_blocked")
+    elif reporter.get("status") != "authorized":
+        reasons.append("platform_authorization_pending_or_blocked")
+    if reporter.get("source") == "legacy_authorization":
+        warnings.append({"code": "legacy_roles_not_separated"})
+    local_author = effective_account(case, platform, "author")
+    if reporter.get("account_id") and reporter.get("account_id") == local_author.get("account_id"):
+        warnings.append({"code": "consider_non_author_reporter_for_search_visibility"})
+    channel = candidate.get("complaint_channel_review", {})
+    channel = channel if isinstance(channel, dict) else {}
+    requirement = channel.get("account_requirement", "authorized_account")
+    if requirement == "author_account":
+        reasons.append("channel_requires_author_account_handoff")
+    elif requirement == "verified_claimant_identity":
+        check = channel.get("reporter_identity_check", {})
+        if (not isinstance(check, dict) or not reporter.get("account_id")
+                or check.get("account_id") != reporter["account_id"]
+                or check.get("status") != "verified" or not valid_account_timestamp(check.get("reviewed_at"))):
+            reasons.append("channel_requires_verified_reporter_identity")
+    elif requirement != "authorized_account":
+        reasons.append("unknown_channel_account_requirement")
+    uploader = str(candidate.get("uploader_id", ""))
+    if uploader and uploader in known_own_account_ids(case, platform):
+        reasons.append("uploader_is_authorized_own_account")
+    if uploader and uploader == reporter.get("account_id"):
+        reasons.append("uploader_is_reporting_account")
+    return reasons, warnings
 
 
 def platform_scope(case):
@@ -270,30 +458,35 @@ def report(case):
             "active_todo", "excluded_from_active_todo", "historical_submitted")
     scope = platform_scope(case)
     by_platform = {platform: dict.fromkeys(keys, 0) for platform in PLATFORMS}
+    by_route = {route: dict.fromkeys(keys, 0) for route in (*COMPLAINT_ROUTES, "unknown")}
     for candidate in case.get("candidates", []):
         platform = candidate.get("platform")
-        bucket = by_platform.setdefault(platform if platform in PLATFORMS else "other", dict.fromkeys(keys, 0))
-        bucket["candidates_total"] += 1
+        platform_bucket = by_platform.setdefault(platform if platform in PLATFORMS else "other", dict.fromkeys(keys, 0))
+        route = candidate.get("complaint_route", "copyright")
+        route = route if valid_complaint_route(platform, route) else "unknown"
         state = candidate.get("submission_status")
-        bucket[state if state in states else "other_status"] += 1
-        if recorded_submission(candidate):
-            bucket["historical_submitted"] += 1
-        if state != "submitted":
-            if platform in scope["active_platforms"]:
-                bucket["active_todo"] += 1
-            else:
-                bucket["excluded_from_active_todo"] += 1
-        for field, positive, counter in (("review_result", "approved", "review_approved"), ("removal_result", "removed", "taken_down")):
-            outcome = candidate.get(field)
-            if (isinstance(outcome, dict) and outcome.get("status") == positive
-                    and outcome.get("verified") is True
-                    and isinstance(outcome.get("evidence_ref"), str) and outcome["evidence_ref"].strip()):
-                bucket[counter] += 1
+        for bucket in (platform_bucket, by_route[route]):
+            bucket["candidates_total"] += 1
+            bucket[state if state in states else "other_status"] += 1
+            if recorded_submission(candidate):
+                bucket["historical_submitted"] += 1
+            if state != "submitted":
+                if platform in scope["active_platforms"]:
+                    bucket["active_todo"] += 1
+                else:
+                    bucket["excluded_from_active_todo"] += 1
+            for field, positive, counter in (("review_result", "approved", "review_approved"), ("removal_result", "removed", "taken_down")):
+                outcome = candidate.get(field)
+                if (isinstance(outcome, dict) and outcome.get("status") == positive
+                        and outcome.get("verified") is True
+                        and isinstance(outcome.get("evidence_ref"), str) and outcome["evidence_ref"].strip()):
+                    bucket[counter] += 1
     return {"case_id": case["case_id"], "read_only": True,
             "platform_scope": scope,
             "totals": {key: sum(counts[key] for counts in by_platform.values()) for key in keys},
             "by_platform": by_platform,
-            "notice": "All platforms remain in the recorded counts. active_todo counts non-submitted states on active platforms, including supplement/uncertain follow-up; excluded_from_active_todo counts the other non-submitted states. historical_submitted counts submitted states or a timezone-aware submitted_at plus a nonempty receipt_id/receipt_path, retaining documented submissions after status changes. Todo counts do not authorize retrying supplement, unknown, submitting or failed records. Review approval and removal require separately verified results with references; this metadata report does not revalidate receipts or evidence."}
+            "by_route": by_route,
+            "notice": "All platforms remain in the recorded counts. by_route separates copyright complaints and Kuaishou general reports; missing legacy routes remain copyright, and invalid routes are unknown. A general-report approval is not a copyright determination. active_todo counts non-submitted states on active platforms, including supplement/uncertain follow-up; excluded_from_active_todo counts the other non-submitted states. historical_submitted counts submitted states or a timezone-aware submitted_at plus a nonempty receipt_id/receipt_path, retaining documented submissions after status changes. Todo counts do not authorize retrying supplement, unknown, submitting or failed records. Review approval and removal require separately verified results with references; this metadata report does not revalidate receipts or evidence."}
 
 
 def public_url(value: str) -> str:
@@ -386,9 +579,16 @@ def canonical_url(platform: str, video_id: str) -> str:
             "bilibili": "https://www.bilibili.com/video/", "xiaohongshu": "https://www.xiaohongshu.com/explore/"}[platform] + video_id
 
 
+def valid_complaint_route(platform, route):
+    return route == "copyright" or (route == "general_report" and platform == "kuaishou")
+
+
 def candidate_add(root: Path, case, args):
     if not args.title.strip():
         raise CaseError("candidate_title_required")
+    route = getattr(args, "complaint_route", "copyright")
+    if not valid_complaint_route(args.platform, route):
+        raise CaseError("unsupported_complaint_route_for_platform")
     video_id = normalize_content_id(args.platform, args.video_id)
     url = canonical_url(args.platform, video_id)
     if args.original_id not in {w.get("work_id") for w in case.get("works", [])}:
@@ -404,6 +604,7 @@ def candidate_add(root: Path, case, args):
         "canonical_url": url, "uploader_id": args.uploader_id or "",
         "title": args.title, "original_work_id": args.original_id, "discovered_at": now(),
         "uploader_id_verified": False,
+        "complaint_route": route,
         "evidence_mode": "local_video",
         "browser_visual_review": None,
         "overlap_segments": [],
@@ -537,6 +738,8 @@ def gate(root: Path, case, candidate_id: str):
     if len(candidates) != 1:
         raise CaseError("unknown_or_duplicate_candidate_id")
     candidate = candidates[0]
+    route = candidate.get("complaint_route", "copyright")
+    general_report = route == "general_report" and candidate.get("platform") == "kuaishou"
     reasons = []
     warnings = []
     scope = platform_scope(case)
@@ -547,7 +750,10 @@ def gate(root: Path, case, candidate_id: str):
     if reasons:
         return {"candidate_id": candidate_id, "status": "blocked",
                 "evidence_mode": candidate.get("evidence_mode", "local_video"),
+                "complaint_route": route,
                 "network_submission_performed": False, "reasons": reasons, "warnings": []}
+    if not valid_complaint_route(candidate.get("platform"), route):
+        reasons.append("unsupported_complaint_route_for_platform")
     try:
         expected_url = canonical_url(candidate.get("platform"), candidate.get("video_id", ""))
         if candidate.get("canonical_url") != expected_url:
@@ -556,7 +762,7 @@ def gate(root: Path, case, candidate_id: str):
         reasons.append("invalid_candidate_platform_or_video_id")
     if candidate.get("submission_status") != "not_submitted":
         reasons.append("submission_already_sent_unknown_or_not_cleared")
-    if not intake_status(root)["complete"]:
+    if not general_report and not intake_status(root)["complete"]:
         reasons.append("private_intake_incomplete")
     verification = verify_evidence(root)
     work_id = candidate.get("original_work_id")
@@ -564,7 +770,7 @@ def gate(root: Path, case, candidate_id: str):
     # Only material bound to this claim (plus account-wide profile proof) blocks
     # this gate. Other cases' missing files are reported, never silently ignored.
     for entry, check in zip(manifest(root)["evidence"], verification["evidence"]):
-        relevant = isinstance(entry, dict) and (
+        relevant = isinstance(entry, dict) and not (general_report and entry.get("kind") in SCREENSHOT_KINDS) and (
             entry.get("kind") == "douyin_profile"
             or entry.get("candidate_id") == candidate_id
             or (not entry.get("candidate_id") and bool(work_id) and entry.get("work_id") == work_id)
@@ -576,16 +782,16 @@ def gate(root: Path, case, candidate_id: str):
                 warnings.append({"code": "unrelated_evidence_integrity_failed", **check})
         elif relevant:
             evidence.append(entry)
-    for kind in SCREENSHOT_KINDS:
+    for kind in (() if general_report else SCREENSHOT_KINDS):
         if not any(e.get("kind") == kind and (kind == "douyin_profile" or (bool(work_id) and e.get("work_id") == work_id)) for e in evidence):
             reasons.append("missing_" + kind)
     if case.get("full_access_acknowledged") is not True:
         reasons.append("full_access_not_acknowledged")
-    for platform in set(("douyin", candidate.get("platform"))):
-        if platform not in PLATFORMS or case.get("authorizations", {}).get(platform, {}).get("status") != "authorized":
-            reasons.append("platform_authorization_pending_or_blocked")
+    role_reasons, role_warnings = account_gate(case, candidate)
+    reasons.extend(role_reasons)
+    warnings.extend(role_warnings)
     rights = case.get("rights_review", {})
-    if rights.get("identity_status") != "user_verified":
+    if not general_report and rights.get("identity_status") != "user_verified":
         reasons.append("identity_pending_or_blocked")
     if rights.get("ownership_status") != "user_verified":
         reasons.append("ownership_pending_or_blocked")
@@ -621,9 +827,6 @@ def gate(root: Path, case, candidate_id: str):
         reasons.append("uploader_account_id_not_verified")
     if isinstance(entries, list) and any(isinstance(e, dict) and e.get("platform") == candidate.get("platform") and str(e.get("uploader_id")) == str(uploader_id) for e in entries):
         reasons.append("uploader_is_whitelisted")
-    own_account = case.get("authorizations", {}).get(candidate.get("platform"), {}).get("account_id")
-    if own_account and own_account == uploader_id:
-        reasons.append("uploader_is_authorized_own_account")
     overlaps = candidate.get("overlap_segments")
     if evidence_mode == "local_video" and (not isinstance(overlaps, list) or not any(valid_overlap(segment) for segment in overlaps)):
         reasons.append("specific_continuous_overlap_not_human_verified")
@@ -633,7 +836,7 @@ def gate(root: Path, case, candidate_id: str):
     channel = candidate.get("complaint_channel_review", {})
     channel = channel if isinstance(channel, dict) else {}
     observed_path = channel.get("observed_path")
-    if (channel.get("status") != "verified" or channel.get("infringement_entry_verified") is not True
+    if (channel.get("status") != "verified" or (not general_report and channel.get("infringement_entry_verified") is not True)
             or not isinstance(observed_path, list) or not observed_path
             or not all(isinstance(step, str) and step.strip() for step in observed_path)):
         reasons.append("complaint_channel_not_verified")
@@ -641,6 +844,7 @@ def gate(root: Path, case, candidate_id: str):
     if authorization.get("user_confirmed") is not True or not authorization.get("confirmed_at") or candidate_id not in authorization.get("candidate_ids", []):
         reasons.append("target_not_explicitly_authorized_for_submission")
     return {"candidate_id": candidate_id, "status": "blocked" if reasons else "ready_for_submission_review",
+            "complaint_route": route,
             "evidence_mode": evidence_mode, "network_submission_performed": False,
             "reasons": list(dict.fromkeys(reasons)), "warnings": warnings}
 
@@ -648,10 +852,17 @@ def gate(root: Path, case, candidate_id: str):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("init", "intake", "status", "report", "summary", "verify", "evidence-add", "candidate-add", "platform-withdraw", "gate"):
+    for name in ("init", "intake", "status", "accounts", "account-set", "report", "summary", "verify", "evidence-add", "candidate-add", "platform-withdraw", "gate"):
         command = sub.add_parser(name)
         command.add_argument("--root", required=True, help="Separate case directory")
-        if name == "evidence-add":
+        if name == "account-set":
+            command.add_argument("--platform", choices=PLATFORMS, required=True)
+            command.add_argument("--role", choices=ACCOUNT_ROLES, required=True)
+            command.add_argument("--account-id", required=True, help="Verified stable account ID, not a nickname or login credential")
+            command.add_argument("--authorized", action="store_true", help="Record authorization already given by the user; never implies identity or ownership")
+            command.add_argument("--scope", action="append", choices=("search", "report"), help="Repeat for reporter grants; author only records an identifier and needs no login")
+            command.add_argument("--own-account", action="store_true", help="Record that the user has identified this account as their own; do not infer from login")
+        elif name == "evidence-add":
             command.add_argument("--file", required=True, help="Relative path inside the case; never 00_private")
             command.add_argument("--kind", choices=EVIDENCE_KINDS, required=True)
             command.add_argument("--source-url", required=True)
@@ -666,6 +877,8 @@ def parser():
             command.add_argument("--uploader-id")
             command.add_argument("--title", required=True)
             command.add_argument("--original-id", required=True)
+            command.add_argument("--complaint-route", choices=COMPLAINT_ROUTES, default="copyright",
+                                 help="general_report is available only for an explicitly selected Kuaishou ordinary report")
         elif name == "gate":
             command.add_argument("--candidate", required=True)
         elif name == "platform-withdraw":
@@ -685,6 +898,10 @@ def main(argv=None):
                 result = intake_status(root)
             elif args.command == "status":
                 result = status(root, case)
+            elif args.command == "accounts":
+                result = accounts(case)
+            elif args.command == "account-set":
+                result = account_set(root, case, args)
             elif args.command in ("report", "summary"):
                 result = report(case)
             elif args.command == "verify":

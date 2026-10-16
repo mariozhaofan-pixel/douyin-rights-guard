@@ -1,4 +1,4 @@
 interface:
   display_name: "抖音作者维权"
-  short_description: "私密建档，覆盖抖音、快手和B站首批作品，核验搬运并分别统计投诉处理结果"
-  default_prompt: "使用 $douyin-rights-guard 复用我的授权与资料，逐条处理抖音、快手和B站首批作品，核验搬运并按授权投诉，分别统计待核、提交、审核和下架结果。"
+  short_description: "用户提供作者截图；非作者账号检索举报，脚本批量整理、比对与统计结果"
+  default_prompt: "使用 $douyin-rights-guard，复用我提供的作者截图，只登录非作者检索举报账号，用脚本批量准备材料；抖音和B站走版权投诉，快手优先普通举报，并分别统计处理结果。"

@@ -1,0 +1,113 @@
+# 脚本优先操作
+
+此文件面向执行代理。用户只提供原作、作者侧截图、白名单等资料，并亲自登录非作者检索举报账号；代理执行命令、整理结果，仅在必要的官方页面操作时使用 CU。作者账号不登录、不请求登录授权。
+
+## 工具分工
+
+| 工作 | 默认工具 | 仍需交互的情形 |
+| --- | --- | --- |
+| 作者侧证明 | 用户提供截图/原片，case_manager 登记来源与哈希 | 缺图时一次告知用户补什么，不登录作者账号 |
+| B站公开检索线索 | search_public.py，调用 yt-dlp bilisearch | 索引失败或要核对实际首搜索页时，一次页面采集 |
+| 抖音/快手搜索 | 已有导出/分享文本优先，必要时非作者会话一次采集 | 当前没有本包已验证稳定的匿名搜索脚本 |
+| 搜索去重、首批分母 | workflow.py import-search / report | 无ID的短链需正常解析确认 |
+| 下载与抽样对照 | media_batch.py + media_probe.py | 获取受限时补本地文件或正常平台保存；不能自动判侵权 |
+| 草稿、缺项、附件索引 | workflow.py plan / prepare | 代理实际查看证据，核实事实和授权 |
+| 抖音/B站提交 | 已验证官方版权表单 | 必要的登录、上传、声明和最终按钮 |
+| 快手提交 | 优先网页普通举报，general_report | 当前实际分类不适用或平台拒绝时才另寻专门途径 |
+| 数量与反馈 | workflow.py report / case_manager.py report | 读取平台回执后登记；不会自动猜测审核结果 |
+
+公开搜索 API/提取器不是官方举报 API。脚本没有发送投诉、邮件或自动读取浏览器 Cookie 的功能。
+
+## 1. 案件与账号
+
+```powershell
+$SkillDir = Join-Path $env:USERPROFILE '.codex\skills\douyin-rights-guard'
+$CaseRoot = 'D:\维权项目\作者-日期'
+python "$SkillDir\scripts\case_manager.py" init --root "$CaseRoot"
+```
+
+已有案件省略 init。身份材料与作者截图沿用[本地档案](case-workflow.md)，作品必须已有真实 `work_id` 及用户确认。作者账号只登记标识；以下变量由已核实资料设置，不能直接使用占位值：
+
+```powershell
+python "$SkillDir\scripts\case_manager.py" account-set --root "$CaseRoot" --platform douyin --role author --account-id "$AuthorId"
+python "$SkillDir\scripts\case_manager.py" account-set --root "$CaseRoot" --platform bilibili --role reporter --account-id "$ReporterId" --authorized --scope search --scope report --own-account
+python "$SkillDir\scripts\case_manager.py" accounts --root "$CaseRoot"
+```
+
+`--authorized` 仅记录用户已经给出的对应授权，不会真正登录或征得同意。只有已知是用户自有账号才传 `--own-account`。作者标识不接受 `--authorized` 或 `--scope`。每个平台按实际账号分别登记，切换新 reporter 默认 pending；读取授权与对具体候选的提交授权仍分开。
+
+作者截图登记使用 `evidence-add --user-provided`；未知拍摄时间留空，脚本记录接收时间而不编造拍摄时间。不因缺作者登录就阻止已具备截图的案件。快手普通举报无需为本地检查额外索取身份证或作者后台截图；表单不要求的资料不外发。
+
+## 2. 检索与一次导入
+
+B站先用公开检索脚本；本命令不登录：
+
+```powershell
+python "$SkillDir\scripts\search_public.py" --query "$WorkTitle" --limit 20 --out "$CaseRoot\03_search\bilibili-index.json"
+python "$SkillDir\scripts\workflow.py" import-search --root "$CaseRoot" --file "$CaseRoot\03_search\bilibili-index.json" --platform bilibili --batch-id bili-index-01 --query "$WorkTitle" --sort public-index --account-ref anonymous --batch-kind links --original-id "$OriginalId"
+```
+
+只有搜索回执为 `indexed` 且有有效结果才导入。文件已存在不会覆盖，应复用它或为新一次查询用新文件名。`--limit` 为1–100、默认20，前N条索引不是网页第一页；标题/作者为空时保持未知，不把作品 aid 当作者UID。该功能基于 [yt-dlp BiliBiliSearchIE](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/bilibili.py)，2026-10-16有一次通用词1条的只读查询成功，不能保证其他词或登录结果等价。
+
+三平台都可导入 JSON 数组或 `{"results":[...]}`；CSV字段相同：
+
+```json
+{"results":[{"url":"https://www.douyin.com/video/1234567890","title":"示例作品名","uploader_id":"example_uploader"}]}
+```
+
+以上仅为合成格式示例，执行时使用实际页面作品。文本 `.txt` 可直接保存分享链接。短链不发网络请求解析，保留 `pending_resolution`。通过正常官方页面确认规范作品链接后，使用 `plan` 中对应的批次ID和条目 `key` 登记解析依据：
+
+```powershell
+python "$SkillDir\scripts\workflow.py" resolve-entry --root "$CaseRoot" --batch-id "$BatchId" --item-key "$ItemKey" --url "$ObservedCanonicalUrl" --source-note '记录实际打开的官方作品页及证据文件路径'
+```
+
+链接必须为同平台规范作品URL，不能猜测ID。解析结果单独保存在 `03_search/workflow-resolutions.json`，保留原始批次字节和固定分母；相同解析可复用，冲突目标须先核实原记录。它不会自动创建候选或证明搬运，之后仍按 `plan` 关联真实原作并复核。`report` 的 `unique_resolved_count` 与 `resolved_duplicates` 区分解析后的独立作品和重复条目。
+
+已实际采集整页/首批的 JSON/CSV，才使用 `first` 并注明页面边界：
+
+```powershell
+python "$SkillDir\scripts\workflow.py" import-search --root "$CaseRoot" --file "$CaseRoot\03_search\kuaishou-first.json" --platform kuaishou --batch-id ks-first-01 --query "$WorkTitle" --sort 综合 --account-ref ks-reporter --batch-kind first --source-url "$ObservedSearchUrl" --boundary-note '本次实际稳定加载的首批作品，页面证据另存' --original-id "$OriginalId" --complaint-route general_report
+```
+
+`first`需要实际官方来源页与边界记录；纯分享文本只能 `links`。后续滚动用 `extension --parent-batch ks-first-01`，不修改原首批分母。`--original-id`只对已存在原作建候选；全系列结果不应一律绑第1集，不能确定对应集时先不传，复核后关联。输入中的“已复核/已授权/已提交”等字段不被采信。
+
+快手新候选默认工作流选择 `general_report`；抖音/B站使用 `copyright`。既有候选的旧路线、权属、回执不自动覆盖，避免重新统计或误重投。
+
+## 3. 批量媒体准备与续跑
+
+先把用户给的原视频、已保存候选视频登记为 `original_video`、`candidate_video`，分别绑定原作ID/候选ID。运行：
+
+```powershell
+python "$SkillDir\scripts\media_batch.py" --root "$CaseRoot" --mirror
+```
+
+默认只处理本地文件。确需公开下载时：
+
+```powershell
+python "$SkillDir\scripts\media_batch.py" --root "$CaseRoot" --download --mirror --limit 20
+```
+
+每次最多处理20个需要实际工作的候选；缓存复用不占额度，再运行会继续后面的对象。通过内容哈希及参数判断能否复用对照；证据变化会重新生成，原结果保留。输出包括 `04_candidates/media-batch/`、`05_comparisons/media-batch/`、`08_logs/media_batch_latest.json`。下载缓存按目标URL和文件哈希绑定。
+
+- 下载只用规范官方链接、默认匿名 yt-dlp。快手公开后端须显式 `--kuaishou-public`，失败后保守暂停该平台；尚未真实下载验证。
+- 同平台两次连续 Cookie 要求会暂停，计数跨续跑保留；验证码、拒绝访问或登录限制立即暂停，不切换代理或身份重试。
+- 修复原因后可显式 `--resume-platform douyin --retry-failed`。这两个参数不提供授权、不绕过限制，也不应在条件未变化时使用。
+- 已有 `unknown/submitting/submitted` 候选跳过，先跟进回执；作者本人、当前操作账号、白名单和退出平台跳过。
+- 新下载文件的来源验证仍为 pending，不自动登记成已核验取证。先核实作品来源，再 `evidence-add`；比较报告不自动改变人工复核、权属、白名单或提交授权。
+- `--candidate <候选ID>`可重复，`--interval`和`--max-frames`控制抽样；片段核验仍需实际查看媒体。零匹配不排除搬运。
+
+需要已有明确授权的平台专域Cookie文件时用 `media_probe.py download --cookies <本地路径>` 单条处理，或直接使用用户本地视频；批量脚本不自动取浏览器登录数据。
+
+## 4. 材料准备与结果
+
+```powershell
+python "$SkillDir\scripts\workflow.py" plan --root "$CaseRoot"
+python "$SkillDir\scripts\workflow.py" prepare --root "$CaseRoot"
+python "$SkillDir\scripts\workflow.py" report --root "$CaseRoot"
+```
+
+`plan`输出待解析、待关联原作、缺项、可以进官方表单复核或应先查回执的清单。`prepare`按内容指纹输出 `06_drafts/workflow/<指纹>/`，每候选Markdown草稿、JSON附件引用、缺项以及按平台/路线/原作分组的目标清单。它不复制附件、不读入身份副本、不发送邮件、不提交举报；生成草稿也不代表门槛通过。已有相同包经完整性检查可复用。
+
+抖音同一原作的目标链接可分组填官方批量表单；平台识别丢弃或重复的链接单记，不按输入数计成功。B站按现有逐条表单办理。快手默认使用网页普通举报，优先简洁理由加原作链接，只选择真实适用分类，不为凑数量捏造违规类型；不强制手机或邮件。
+
+`report`同时保留每个批次固定分母和候选状态；跨批作品可能重复，不直接相加成全网独立数量。`by_route`区分版权投诉与普通举报，审核成立和下架只取有证据的已核验状态。平台记录未查过就是未查过；不把普通举报收件当版权裁决。

@@ -1,6 +1,6 @@
 # 本地案件档案与命令
 
-`scripts/case_manager.py` 使用 Python 标准库管理本地案件、文件指纹和提交前检查。它不会登录账号、判断身份证真伪、作出侵权裁决或联网提交投诉。浏览器授权、页面取证、作品复核及官方表单提交由主工作流完成。
+`scripts/case_manager.py` 使用 Python 标准库管理本地案件、文件指纹和提交前检查。它不会登录账号、判断身份证真伪、作出侵权裁决或联网提交投诉。作者侧证明全部由用户提供截图，无需作者账号登录。仅检索举报账号需要授权登录，作品复核及官方表单操作由主工作流完成；批量操作见[脚本优先](script-first.md)。
 
 默认活动范围为**抖音、快手、哔哩哔哩**。小红书字段和旧记录仅保留历史兼容；当前不安排小红书检索、补件或提交。旧授权、待提交包或本地gate曾通过，都不能覆盖用户后来取消平台的指令。
 
@@ -48,7 +48,7 @@ python "$SkillDir\scripts\case_manager.py" init --root "$CaseRoot"
 }
 ```
 
-六项均为必填，包含**手机号**。姓名、邮箱与手机号仅在该私密文件中记录；不要作为命令行参数、公开案件字段或普通日志输出。用户已经提供的资料直接复用，不重复索取。
+版权投诉备用档案的六项包含**手机号**；`intake` 仍按六项检查。快手明确选择 `general_report` 时，`gate` 不强制这些私密资料或三种作者侧截图，只使用实际举报所需材料。姓名、邮箱与手机号仅在该私密文件中记录；不要作为命令行参数、公开案件字段或普通日志输出。用户已经提供的资料直接复用，不重复索取。
 
 证件与手机主页图建议保存为 `00_private/intake/id_front.jpg`、`00_private/intake/id_back.jpg`、`00_private/intake/profile_mobile.png`。`intake` 子目录按需创建。上述三个文件字段填写对应的**案件相对路径**，使用实际扩展名；不得填写绝对路径、`..` 路径或项目外链接。先保存实际附件，再登记路径，不用占位文件假装资料已到齐。
 
@@ -63,7 +63,7 @@ python "$SkillDir\scripts\case_manager.py" status --root "$CaseRoot"
 
 ## 原作、授权与用户确认字段
 
-可以在案件内手动编辑 UTF-8 JSON，保持合法格式并保留既有字段。不要将真实姓名、身份证号、邮箱或手机号写入 `case.json`。没有通用 setter 命令；脚本提供初始化、证据登记、候选登记、平台退出和检查。
+可以在案件内手动编辑 UTF-8 JSON，保持合法格式并保留既有字段。不要将真实姓名、身份证号、邮箱或手机号写入 `case.json`。账号角色可用 `account-set` 登记，其他权属与用户确认字段仍按实际事实编辑；脚本另提供初始化、证据登记、候选登记、平台退出和检查。
 
 在 `case.json` 的 `works` 列表中，为每条实际原作建立记录。下例是结构示意，文字占位符必须替换；未经用户确认时保留 `false`：
 
@@ -84,7 +84,7 @@ python "$SkillDir\scripts\case_manager.py" status --root "$CaseRoot"
 | 字段 | 通过检查所需的值与含义 |
 | --- | --- |
 | `full_access_acknowledged` | `true`：已向用户说明权限要求，并核对本次环境满足所需权限 |
-| `authorizations.<platform>.status` | `authorized`：该平台登录与操作授权已具备；活动平台键为 `douyin`、`kuaishou`、`bilibili`，`xiaohongshu`仅保留历史兼容。该字段不替代活动范围检查 |
+| `authorizations.<platform>.status` | 旧格式登录授权，仅兼容既有检索举报记录；作者截图不需要此字段。新案件用 `account_roles.<platform>.reporter`。活动平台键为 `douyin`、`kuaishou`、`bilibili`，`xiaohongshu`仅保留历史兼容。该字段不替代活动范围检查 |
 | `authorizations.<platform>.account_id` | 自己在该平台的稳定账号 ID，用于识别自己的账号；不填显示昵称 |
 | `authorizations.<platform>.authorized_at` | 实际授权时间，建议带时区的 ISO 8601 |
 | `rights_review.identity_status` | `user_verified`：用户已核对身份与权利人或代理关系 |
@@ -310,7 +310,7 @@ python "$SkillDir\scripts\case_manager.py" evidence-add --root "$CaseRoot" --fil
 }
 ```
 
-按用户明确要求，人工在实际UI先确认并选择侵权入口，再选择其中的搬运分支，记录连续的实际入口关系后，才设置 `status: "verified"` 和 `infringement_entry_verified: true`。`observed_path` 必须是按操作顺序排列的非空字符串数组，每项记录实际观察到的页面或选项，不能只是一个笼统的“已确认”字符串。脚本不硬编码按钮文字，也不联网核验该陈述；应在案件记录中保留相应页面证据。直接进入搬运、仅见“盗搬稿件举报”标题或相似表单、仅有深链，均不满足这项核验。此前观察到B站自然人／原创本人表单不自动证明路线正确，不能据此填已验证。旧候选缺少此字段时同样阻断提交，不自动迁移为已验证。
+对copyright路线，人工在实际UI先确认并选择侵权入口，再选择其中的搬运分支，记录连续的实际入口关系后，才设置 `status: "verified"` 和 `infringement_entry_verified: true`。`observed_path` 必须是按操作顺序排列的非空字符串数组，每项记录实际观察到的页面或选项，不能只是一个笼统的“已确认”字符串。脚本不硬编码按钮文字，也不联网核验该陈述；应在案件记录中保留相应页面证据。直接进入搬运、仅见“盗搬稿件举报”标题或相似表单、仅有深链，均不满足这项核验。此前观察到B站自然人／原创本人表单不自动证明路线正确，不能据此填已验证。旧候选缺少此字段时同样阻断提交，不自动迁移为已验证。
 
 ## 提交前检查与回执
 
@@ -373,3 +373,25 @@ python "$SkillDir\scripts\case_manager.py" summary --root "$CaseRoot"
 只有独立查到明确审核通过结果，才记录 `review_result.status: "approved"`；只有明确核实内容已经移除，才记录 `removal_result.status: "removed"`。对应项还须 `verified: true`、`evidence_ref` 为非空的实际证据引用，统计才分别计入 `review_approved` 和 `taken_down`。上传成功、提交成功、审核中、页面暂时打不开或24小时提示均不能填写这两个正向结果。引用不在统计输出中显示；该命令按已记录元数据计数，不代替证据真伪或当前状态复核。
 
 每个平台有页码的第一页、无页码的固定首批已加载作品是否已全部处理，须另外在搜索记录中保留边界、实际结果条数、逐条处置和遗漏原因；候选统计不包含未登记的搜索结果，不能用 `report` 的数量冒充首批覆盖量或全部处理完成。后续新加载项另记扩展批，具体口径见[检索与人工复核](search-and-review.md)。
+
+## 账号标识与举报登录（2026-10-16）
+
+作者材料由用户截图提供；`author`仅保存稳定账号ID，供关联作品和排除自有账号，不需要授权登录。仅`reporter`登录，记录search/report用途。已知自有账号、历史作者和旧自有记录均参与排除；切换reporter不会覆盖作者证据、真实权利人或历史回执。
+
+```powershell
+python "$SkillDir\scripts\case_manager.py" account-set --root "$CaseRoot" --platform douyin --role author --account-id "$AuthorId"
+python "$SkillDir\scripts\case_manager.py" account-set --root "$CaseRoot" --platform kuaishou --role reporter --account-id "$ReporterId" --authorized --scope search --scope report --own-account
+python "$SkillDir\scripts\case_manager.py" accounts --root "$CaseRoot"
+```
+
+`--own-account`只用于用户明确自有的账号；非作者账号不自动等于第三人或代理。`--authorized`仅记录已有授权，不执行登录或授予权限。作者角色不能传授权参数；reporter换号默认pending，不能继承前一个账号授权。旧案没有role字段时按旧目标平台授权兼容并提示角色未分开；不再因缺抖音作者登录授权而阻断其他平台案件。
+
+`account_roles.<platform>`保存author、reporter、known_own_account_ids和history。reporter记录authorized_scopes、authorized_at和account_id；author为identified、无登录scopes。实际平台若要求原作者登录，`complaint_channel_review.account_requirement=author_account`记录为需用户接续的限制，不启动作者登录。实名要求使用verified_claimant_identity，并由reporter_identity_check的account_id/status/reviewed_at绑定实际举报账号，切换后重核。省略account_requirement只代表未记录额外账号门槛，不等于平台保证所有账号能投。
+
+## 普通举报与版权投诉
+
+`candidate-add --complaint-route copyright|general_report`；省略为copyright，general_report仅快手可用。工作流对新快手任务显式选general_report，旧记录不批量改写。未提交旧候选需要切换时先确认其status为not_submitted并据用户选择记录新route，保留变更依据；submitted/unknown/submitting先查回执，不能用换route重投。
+
+快手general_report的gate不强制私密intake、身份验证标记和三类作者截图，避免为了普通举报收集无关资料；仍要求真实原作及权属陈述、已核实对应画面、白名单、目标授权、reporter report授权，以及实际普通举报路径status=verified/observed_path。它不要求infringement_entry_verified。抖音/B站和copyright路线保留侵权入口检查。
+
+report.by_route分别给copyright/general_report/unknown计数，原totals仍是所有已登记举报的合计。审核和下架依独立证据状态；general_report的审核结果不能称作版权裁决。生成草稿、准备附件、gate通过都不会写submitted。

@@ -118,3 +118,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## 脚本优先批处理（2026-10-16）
+
+先读[脚本优先操作](script-first.md)。`search_public.py` 封装B站公开索引检索，`media_batch.py` 复用本案已登记媒体并有界下载/对照，`workflow.py`统一结果清单、草稿和报告。作者侧全部使用用户提供的截图和优先本地原片，不再要求作者账号授权登录；候选作品必要的浏览器取样使用检索举报账号。
+
+`media_batch.py --root CASE` 默认离线，`--download`才启用公开下载；缓存绑定作品URL、内容哈希与比较参数，停止状态跨调用保留。遇取证限制转已有本地文件或正常平台保存，不把反复CU尝试当自动化。网络搜索/下载成功不代表来源、白名单、权属或人工复核已通过。

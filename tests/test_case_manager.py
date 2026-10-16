@@ -77,6 +77,313 @@ class CaseManagerTests(unittest.TestCase):
         self.save_case()
         return candidate_id
 
+    def set_account(self, account_id, role="reporter", platform="douyin", scopes=None, own=False):
+        args = argparse.Namespace(platform=platform, role=role, account_id=account_id,
+                                  authorized=scopes is not None, scope=scopes, own_account=own)
+        return cm.account_set(self.root, self.case, args)
+
+    def test_account_roles_legacy_case_remains_usable_and_reports_unsplit_roles(self):
+        candidate_id = self.prepare_ready()
+        self.case.pop("account_roles")
+        result = cm.gate(self.root, self.case, candidate_id)
+        self.assertEqual(result["status"], "ready_for_submission_review")
+        self.assertIn({"code": "legacy_roles_not_separated"}, result["warnings"])
+        report = cm.accounts(self.case)
+        self.assertIn("legacy_roles_not_separated", report["platforms"]["douyin"]["issues"])
+        self.assertNotIn("account_roles", self.case)
+
+    def test_separate_reporter_keeps_existing_author_grant_and_does_not_infer_ownership(self):
+        candidate_id = self.prepare_ready()
+        before_rights = copy.deepcopy(self.case["rights_review"])
+        before_legacy = copy.deepcopy(self.case["authorizations"])
+        self.set_account("alternate_account", scopes=["search", "report"])
+        result = cm.gate(self.root, self.case, candidate_id)
+        self.assertEqual(result["status"], "ready_for_submission_review")
+        self.assertEqual(self.case["authorizations"], before_legacy)
+        self.assertEqual(self.case["rights_review"], before_rights)
+        self.assertFalse(self.case["account_roles"]["douyin"]["reporter"]["own_account"])
+        self.assertNotIn("alternate_account", cm.known_own_account_ids(self.case, "douyin"))
+        self.assertEqual(cm.effective_account(self.case, "douyin", "author")["account_id"], "original_account")
+
+    def test_reporter_switch_never_inherits_old_or_legacy_report_authorization(self):
+        candidate_id = self.prepare_ready()
+        self.set_account("alternate_one", scopes=["search", "report"], own=True)
+        before_candidates = copy.deepcopy(self.case["candidates"])
+        before_submission = copy.deepcopy(self.case["submission_authorization"])
+        result = self.set_account("alternate_two")
+        self.assertTrue(result["account_switched"])
+        reporter = cm.effective_account(self.case, "douyin", "reporter")
+        self.assertEqual(reporter["status"], "pending")
+        self.assertEqual(reporter["authorized_scopes"], [])
+        self.assertIn("reporter_report_authorization_pending", cm.gate(self.root, self.case, candidate_id)["reasons"])
+        self.assertEqual(self.case["candidates"], before_candidates)
+        self.assertEqual(self.case["submission_authorization"], before_submission)
+        self.assertEqual(self.case["account_roles"]["douyin"]["history"][0]["account_id"], "alternate_one")
+
+    def test_author_identifier_is_independent_from_reporter_and_cannot_submit(self):
+        candidate_id = self.prepare_ready()
+        self.set_account("original_account", role="author", own=True)
+        self.assertEqual(cm.effective_account(self.case, "douyin", "author")["status"], "identified")
+        self.assertIn("reporter_account_missing", cm.gate(self.root, self.case, candidate_id)["reasons"])
+        self.set_account("alternate_one", scopes=["search", "report"])
+        self.assertEqual(cm.gate(self.root, self.case, candidate_id)["status"], "ready_for_submission_review")
+        self.set_account("alternate_two", scopes=["report"])
+        self.assertEqual(cm.effective_account(self.case, "douyin", "author")["account_id"], "original_account")
+        self.assertEqual(cm.gate(self.root, self.case, candidate_id)["status"], "ready_for_submission_review")
+
+    def test_search_authorization_does_not_authorize_report_and_authorization_does_not_verify_identity(self):
+        candidate_id = self.prepare_ready()
+        self.case["rights_review"]["identity_status"] = "pending"
+        self.set_account("alternate_one", scopes=["search"], own=True)
+        reasons = cm.gate(self.root, self.case, candidate_id)["reasons"]
+        self.assertIn("reporter_report_authorization_pending", reasons)
+        self.assertIn("identity_pending_or_blocked", reasons)
+        self.assertEqual(self.case["rights_review"]["identity_status"], "pending")
+
+    def test_all_known_own_and_author_accounts_remain_excluded_after_switch(self):
+        candidate_id = self.prepare_ready()
+        self.set_account("first_author", role="author")
+        self.set_account("second_author", role="author")
+        self.set_account("first_reporter", scopes=["report"], own=True)
+        self.set_account("second_reporter", scopes=["report"], own=True)
+        self.set_account("delegate_reporter", scopes=["report"])
+        candidate = self.case["candidates"][0]
+        expected = {"original_account", "first_author", "second_author", "first_reporter", "second_reporter"}
+        self.assertEqual(cm.known_own_account_ids(self.case, "douyin"), expected)
+        for account_id in expected:
+            with self.subTest(account_id=account_id):
+                candidate["uploader_id"] = account_id
+                self.assertIn("uploader_is_authorized_own_account", cm.gate(self.root, self.case, candidate_id)["reasons"])
+        candidate["uploader_id"] = "delegate_reporter"
+        reasons = cm.gate(self.root, self.case, candidate_id)["reasons"]
+        self.assertIn("uploader_is_reporting_account", reasons)
+        self.assertNotIn("uploader_is_authorized_own_account", reasons)
+
+    def test_own_account_exclusion_is_platform_specific(self):
+        candidate_id = self.prepare_ready()
+        self.set_account("uploader_456", platform="bilibili", scopes=["report"], own=True)
+        self.assertEqual(cm.gate(self.root, self.case, candidate_id)["status"], "ready_for_submission_review")
+
+    def test_same_author_reporter_warns_but_is_not_universally_forbidden(self):
+        candidate_id = self.prepare_ready()
+        self.set_account("original_account", scopes=["report"], own=True)
+        result = cm.gate(self.root, self.case, candidate_id)
+        self.assertEqual(result["status"], "ready_for_submission_review")
+        self.assertIn({"code": "consider_non_author_reporter_for_search_visibility"}, result["warnings"])
+
+    def test_channel_author_account_requirement_blocks_alternate_reporter(self):
+        candidate_id = self.prepare_ready()
+        self.set_account("alternate_account", scopes=["report"])
+        self.case["candidates"][0]["complaint_channel_review"]["account_requirement"] = "author_account"
+        self.assertIn("channel_requires_author_account_handoff", cm.gate(self.root, self.case, candidate_id)["reasons"])
+        self.set_account("original_account", scopes=["report"])
+        self.assertIn("channel_requires_author_account_handoff", cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_channel_identity_check_is_bound_to_current_reporter(self):
+        candidate_id = self.prepare_ready()
+        self.set_account("alternate_one", scopes=["report"])
+        channel = self.case["candidates"][0]["complaint_channel_review"]
+        channel["account_requirement"] = "verified_claimant_identity"
+        self.assertIn("channel_requires_verified_reporter_identity", cm.gate(self.root, self.case, candidate_id)["reasons"])
+        channel["reporter_identity_check"] = {"account_id": "alternate_one", "status": "verified", "reviewed_at": cm.now()}
+        self.assertEqual(cm.gate(self.root, self.case, candidate_id)["status"], "ready_for_submission_review")
+        self.set_account("alternate_two", scopes=["report"])
+        self.assertIn("channel_requires_verified_reporter_identity", cm.gate(self.root, self.case, candidate_id)["reasons"])
+        channel["reporter_identity_check"].update(account_id="alternate_two", reviewed_at="2026-01-01")
+        self.assertIn("channel_requires_verified_reporter_identity", cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_legacy_non_douyin_login_is_not_proof_of_original_author_account(self):
+        self.case["authorizations"]["bilibili"].update(status="authorized", account_id="old_bili_login", authorized_at=cm.now())
+        candidate = {"platform": "bilibili", "uploader_id": "other_uploader",
+                     "complaint_channel_review": {"account_requirement": "author_account"}}
+        reasons, _ = cm.account_gate(self.case, candidate)
+        self.assertIn("channel_requires_author_account_handoff", reasons)
+        self.assertEqual(cm.effective_account(self.case, "bilibili", "author")["status"], "missing")
+        self.set_account("old_bili_login", platform="bilibili", role="author")
+        self.set_account("old_bili_login", platform="bilibili", scopes=["report"])
+        reasons, _ = cm.account_gate(self.case, candidate)
+        self.assertIn("channel_requires_author_account_handoff", reasons)
+
+    def test_user_supplied_author_evidence_needs_no_author_login_authorization(self):
+        candidate_id = self.prepare_ready()
+        self.case["authorizations"] = {p: {"status": "pending", "account_id": "", "authorized_at": None} for p in cm.PLATFORMS}
+        evidence = cm.manifest(self.root)
+        for record in evidence["evidence"]:
+            if record["kind"] in cm.SCREENSHOT_KINDS:
+                record.update(provided_by="user", captured_at=None, received_at=cm.now())
+        cm.atomic_json(self.root / cm.MANIFEST, evidence)
+        self.set_account("original_account", role="author")
+        self.set_account("alternate_account", scopes=["search", "report"])
+        result = cm.gate(self.root, self.case, candidate_id)
+        self.assertEqual(result["status"], "ready_for_submission_review")
+        self.assertEqual(cm.accounts(self.case)["platforms"]["douyin"]["author"]["authorized_scopes"], [])
+        self.case["candidates"][0]["uploader_id"] = "original_account"
+        self.assertIn("uploader_is_authorized_own_account", cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_bilibili_reporter_needs_no_douyin_author_login_or_role_registration(self):
+        candidate_id = self.prepare_ready()
+        self.case["authorizations"]["douyin"].update(status="pending", account_id="", authorized_at=None)
+        candidate = self.case["candidates"][0]
+        candidate.update(platform="bilibili", video_id="BV1ab411c7mn", canonical_url=cm.canonical_url("bilibili", "BV1ab411c7mn"))
+        self.set_account("bili_reporter", platform="bilibili", scopes=["report"])
+        self.assertEqual(cm.gate(self.root, self.case, candidate_id)["status"], "ready_for_submission_review")
+
+    def test_author_registration_rejects_login_authorization(self):
+        for scopes in (["evidence"], ["search"], ["report"]):
+            with self.subTest(scopes=scopes), self.assertRaisesRegex(cm.CaseError, "author_is_identifier_only"):
+                self.set_account("author_account", role="author", scopes=scopes)
+
+    def test_account_registration_preserves_recorded_receipts_and_claimant_file(self):
+        candidate_id = self.prepare_ready()
+        candidate = self.case["candidates"][0]
+        candidate.update(submission_status="submitted", submitted_at=cm.now(), receipt_id="SYNTHETIC_RECEIPT")
+        before_candidate = copy.deepcopy(candidate)
+        before_private = (self.root / "00_private/claimant.json").read_bytes()
+        self.set_account("alternate_account", scopes=["report"])
+        self.assertEqual(self.case["candidates"][0], before_candidate)
+        self.assertEqual((self.root / "00_private/claimant.json").read_bytes(), before_private)
+        self.assertIn("submission_already_sent_unknown_or_not_cleared", cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_account_set_validates_scope_role_and_never_echoes_identifier(self):
+        for role, scopes in (("author", ["report"]), ("reporter", ["evidence"]), ("reporter", [])):
+            with self.subTest(role=role, scopes=scopes), self.assertRaises(cm.CaseError):
+                self.set_account("test_account", role=role, scopes=scopes)
+        with self.assertRaises(cm.CaseError):
+            self.set_account("https://example.invalid/user?token=secret", scopes=["search"])
+        result = self.set_account("LOCAL_PRIVATE_ACCOUNT", scopes=["search", "report"])
+        self.assertNotIn("LOCAL_PRIVATE_ACCOUNT", json.dumps(result))
+        self.assertNotIn("LOCAL_PRIVATE_ACCOUNT", json.dumps(cm.accounts(self.case)))
+
+    def test_accounts_command_is_read_only_and_account_set_cli_records_existing_grant(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cm.main(["account-set", "--root", str(self.root), "--platform", "douyin", "--role", "reporter",
+                            "--account-id", "test_alt", "--authorized", "--scope", "search", "--scope", "report", "--own-account"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("test_alt", output.getvalue())
+        before = (self.root / "case.json").read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cm.main(["accounts", "--root", str(self.root)]), 0)
+        self.assertEqual((self.root / "case.json").read_bytes(), before)
+
+    def test_malformed_account_roles_fail_closed(self):
+        candidate_id = self.prepare_ready()
+        for registry in ([], {"not_a_platform": {}}, {"douyin": {"history": [None]}},
+                         {"douyin": {"reporter": {"account_id": "test", "status": "authorized"}}}):
+            with self.subTest(registry=registry), self.assertRaisesRegex(cm.CaseError, "invalid_account_roles"):
+                self.case["account_roles"] = registry
+                cm.gate(self.root, self.case, candidate_id)
+
+    def prepare_general_report(self):
+        candidate_id = self.prepare_ready()
+        candidate = self.case["candidates"][0]
+        candidate.update(platform="kuaishou", canonical_url=cm.canonical_url("kuaishou", candidate["video_id"]),
+                         complaint_route="general_report")
+        candidate["complaint_channel_review"].update(infringement_entry_verified=False, observed_path=["举报", "实际适用的普通举报分类"])
+        self.set_account("ks_reporter", platform="kuaishou", scopes=["report"])
+        return candidate_id
+
+    def test_kuaishou_general_report_requires_explicit_route_and_real_observed_channel(self):
+        candidate_id = self.prepare_general_report()
+        candidate = self.case["candidates"][0]
+        result = cm.gate(self.root, self.case, candidate_id)
+        self.assertEqual(result["status"], "ready_for_submission_review")
+        self.assertEqual(result["complaint_route"], "general_report")
+        candidate.pop("complaint_route")
+        self.assertIn("complaint_channel_not_verified", cm.gate(self.root, self.case, candidate_id)["reasons"])
+        self.assertEqual(cm.gate(self.root, self.case, candidate_id)["complaint_route"], "copyright")
+        candidate["complaint_route"] = "general_report"
+        for value in ([], [""], None):
+            candidate["complaint_channel_review"]["observed_path"] = value
+            self.assertIn("complaint_channel_not_verified", cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_general_report_does_not_require_private_identity_or_author_account_screenshots(self):
+        candidate_id = self.prepare_general_report()
+        self.case["rights_review"]["identity_status"] = "pending"
+        data = cm.manifest(self.root)
+        data["evidence"] = [e for e in data["evidence"] if e["kind"] not in cm.SCREENSHOT_KINDS]
+        cm.atomic_json(self.root / cm.MANIFEST, data)
+        (self.root / "00_private/claimant.json").unlink()
+        with mock.patch.object(cm, "intake_status", side_effect=AssertionError("ordinary report must not read private intake")):
+            self.assertEqual(cm.gate(self.root, self.case, candidate_id)["status"], "ready_for_submission_review")
+
+    def test_general_report_retains_copy_ownership_whitelist_target_and_reporter_requirements(self):
+        candidate_id = self.prepare_general_report()
+        original = copy.deepcopy(self.case)
+        variants = [
+            (lambda: self.case["candidates"][0]["manual_review"].update(status="pending"), "human_review_pending"),
+            (lambda: self.case["candidates"][0].update(overlap_segments=[]), "specific_continuous_overlap_not_human_verified"),
+            (lambda: self.case["works"][0].update(user_confirmed=False), "original_title_and_link_not_user_confirmed"),
+            (lambda: self.case["rights_review"].update(ownership_status="pending"), "ownership_pending_or_blocked"),
+            (lambda: self.case["whitelist"].update(user_confirmed=False), "whitelist_not_explicitly_confirmed"),
+            (lambda: self.case["submission_authorization"].update(candidate_ids=[]), "target_not_explicitly_authorized_for_submission"),
+            (lambda: self.set_account("new_ks_reporter", platform="kuaishou"), "reporter_report_authorization_pending"),
+        ]
+        for change, reason in variants:
+            with self.subTest(reason=reason):
+                self.case = copy.deepcopy(original)
+                change()
+                self.assertIn(reason, cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_general_report_cannot_weaken_douyin_or_bilibili_copyright_gate(self):
+        candidate_id = self.prepare_ready()
+        candidate = self.case["candidates"][0]
+        candidate["complaint_route"] = "general_report"
+        candidate["complaint_channel_review"]["infringement_entry_verified"] = False
+        for platform in ("douyin", "bilibili"):
+            candidate.update(platform=platform, canonical_url=cm.canonical_url(platform, candidate["video_id"]))
+            reasons = cm.gate(self.root, self.case, candidate_id)["reasons"]
+            self.assertIn("unsupported_complaint_route_for_platform", reasons)
+            self.assertIn("complaint_channel_not_verified", reasons)
+
+    def test_general_report_does_not_override_original_author_channel_requirement(self):
+        candidate_id = self.prepare_general_report()
+        self.case["candidates"][0]["complaint_channel_review"]["account_requirement"] = "author_account"
+        self.assertIn("channel_requires_author_account_handoff", cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_general_report_skips_unused_corrupt_author_screenshot_but_not_original_video(self):
+        candidate_id = self.prepare_general_report()
+        (self.root / "02_originals/douyin_profile.png").write_bytes(b"changed")
+        self.assertEqual(cm.gate(self.root, self.case, candidate_id)["status"], "ready_for_submission_review")
+        (self.root / "02_originals/original.mp4").write_bytes(b"changed")
+        self.assertIn("evidence_integrity_failed", cm.gate(self.root, self.case, candidate_id)["reasons"])
+
+    def test_route_statistics_separate_general_report_and_copyright_submission_and_outcomes(self):
+        self.case["candidates"] = [
+            {"platform": "douyin", "submission_status": "submitted"},
+            {"platform": "bilibili", "complaint_route": "copyright", "submission_status": "submitted",
+             "review_result": {"status": "approved", "verified": True, "evidence_ref": "07_receipts/test-a.png"}},
+            {"platform": "kuaishou", "complaint_route": "general_report", "submission_status": "submitted",
+             "review_result": {"status": "approved", "verified": True, "evidence_ref": "07_receipts/test-b.png"},
+             "removal_result": {"status": "removed", "verified": False, "evidence_ref": "07_receipts/not-verified.png"}},
+            {"platform": "bilibili", "complaint_route": "general_report", "submission_status": "submitted"},
+            {"platform": "kuaishou", "complaint_route": "general_report", "submission_status": "needs_supplement",
+             "submitted_at": cm.now(), "receipt_id": "SYNTHETIC_RECEIPT"},
+        ]
+        before = copy.deepcopy(self.case)
+        result = cm.report(self.case)
+        self.assertEqual(result["totals"]["submitted"], 4)
+        self.assertEqual(result["by_route"]["copyright"]["submitted"], 2)
+        self.assertEqual(result["by_route"]["general_report"]["submitted"], 1)
+        self.assertEqual(result["by_route"]["unknown"]["submitted"], 1)
+        self.assertEqual(result["by_route"]["general_report"]["historical_submitted"], 2)
+        self.assertEqual(result["by_route"]["general_report"]["review_approved"], 1)
+        self.assertEqual(result["by_route"]["copyright"]["review_approved"], 1)
+        self.assertEqual(result["by_route"]["general_report"]["taken_down"], 0)
+        self.assertEqual(self.case, before)
+
+    def test_candidate_route_defaults_and_cli_rejects_general_report_for_other_platforms(self):
+        self.add_candidate()
+        self.assertEqual(self.case["candidates"][0]["complaint_route"], "copyright")
+        args = cm.parser().parse_args(["candidate-add", "--root", str(self.root), "--platform", "kuaishou",
+                                      "--video-id", "new_ks", "--title", "Synthetic", "--original-id", "work_1",
+                                      "--complaint-route", "general_report"])
+        cm.candidate_add(self.root, self.case, args)
+        self.assertEqual(self.case["candidates"][1]["complaint_route"], "general_report")
+        args.platform = "bilibili"
+        with self.assertRaisesRegex(cm.CaseError, "unsupported_complaint_route_for_platform"):
+            cm.candidate_add(self.root, self.case, args)
+
     def add_browser_screenshot(self, name, kind, candidate_id, source_url=None):
         path = self.root / "04_candidates" / name
         color = bytes((sum(name.encode()) % 256, len(name) % 256, 90))
@@ -798,8 +1105,9 @@ class CaseManagerTests(unittest.TestCase):
         (self.root / "02_originals/unrelated-candidate.mp4").write_bytes(b"changed")
         result = cm.gate(self.root, self.case, candidate_id)
         self.assertEqual(result["status"], "ready_for_submission_review")
-        self.assertEqual(len(result["warnings"]), 2)
-        self.assertEqual({w["status"] for w in result["warnings"]}, {"missing", "changed"})
+        integrity_warnings = [w for w in result["warnings"] if w["code"] == "unrelated_evidence_integrity_failed"]
+        self.assertEqual(len(integrity_warnings), 2)
+        self.assertEqual({w["status"] for w in integrity_warnings}, {"missing", "changed"})
         self.assertFalse(cm.verify_evidence(self.root)["ok"])
 
     def test_relevant_candidate_work_and_profile_corruption_blocks(self):
@@ -811,7 +1119,7 @@ class CaseManagerTests(unittest.TestCase):
             result = cm.gate(self.root, self.case, candidate_id)
             self.assertEqual(result["status"], "blocked")
             self.assertIn("evidence_integrity_failed", result["reasons"])
-            self.assertEqual(result["warnings"], [])
+            self.assertFalse(any(w["code"] == "unrelated_evidence_integrity_failed" for w in result["warnings"]))
             path.write_bytes(original)
 
     def test_empty_whitelist_requires_explicit_confirmation(self):
